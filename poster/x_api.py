@@ -180,10 +180,10 @@ class XPoster:
         auth_token: str,
         xtid: Any,
         image_path: str,
-    ) -> str:
+    ) -> str | None:
         """Upload an image via upload.x.com (INIT/APPEND/FINALIZE).
 
-        Returns the ``media_id`` string.
+        Returns the ``media_id`` string, or ``None`` on failure.
         """
         import os
 
@@ -202,8 +202,25 @@ class XPoster:
             "media_category": "tweet_image",
         }
         resp = session.post(upload_url, headers=headers_no_ct, params=init_params)
-        init_data = resp.json()
-        media_id = str(init_data["media_id"])
+
+        # Log raw response before attempting JSON parse
+        raw_text = resp.text[:200] if resp.text else "(empty)"
+        logger.info("Media INIT response: status=%d, body=%s", resp.status_code, raw_text)
+
+        if resp.status_code != 200:
+            logger.error("Media INIT failed: status=%d, body=%s", resp.status_code, raw_text)
+            return None
+
+        try:
+            init_data = resp.json()
+        except Exception as exc:
+            logger.error("Media INIT JSON parse failed: %s, body=%s", exc, raw_text)
+            return None
+
+        media_id = str(init_data.get("media_id", ""))
+        if not media_id:
+            logger.error("Media INIT response missing media_id: %s", raw_text)
+            return None
         logger.info("Media INIT: media_id=%s", media_id)
 
         # Step 2 — APPEND

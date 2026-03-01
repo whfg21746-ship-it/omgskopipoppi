@@ -73,13 +73,15 @@ def post_to_community(
         text = text.replace("{token_symbol}", token_symbol)
         text = text.replace("{community_url}", community_url)
 
-        # 6. Upload media if enabled
+        # 6. Upload media if enabled (fall back to text-only on failure)
         media_id = None
         if post_pool.use_photo:
             image_path = post_pool.get_random_image_path()
             if image_path:
                 logger.info("Uploading image: %s", image_path)
                 media_id = XPoster.upload_media(session, ct0, auth_token, xtid, image_path)
+                if media_id is None:
+                    logger.warning("upload_media returned None — falling back to text-only post")
 
         # 7. Create tweet in community
         logger.info("Creating tweet in community %s...", community_id)

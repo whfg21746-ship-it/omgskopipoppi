@@ -190,6 +190,11 @@ async def run_auto_post(
         account = post_pool.get_current_account()
         token_preview = account["auth_token"][:8] if account else "???"
 
+        # Store repost context on the bot with a short UUID key (avoids 64-byte callback_data limit)
+        repost_key = bot.store_repost_context(
+            community_id, community_url, token_name, token_symbol
+        )
+
         if result["success"]:
             tweet_id = result["tweet_id"]
             tweet_url = result.get("tweet_url", "")
@@ -202,7 +207,7 @@ async def run_auto_post(
                 "inline_keyboard": [[
                     {
                         "text": "Repost with different account",
-                        "callback_data": f"repost:{community_id}:{community_url}:{token_name}:{token_symbol}",
+                        "callback_data": f"repost:{repost_key}",
                     }
                 ]]
             }
@@ -217,7 +222,7 @@ async def run_auto_post(
                 "inline_keyboard": [[
                     {
                         "text": "Retry with different account",
-                        "callback_data": f"repost:{community_id}:{community_url}:{token_name}:{token_symbol}",
+                        "callback_data": f"repost:{repost_key}",
                     }
                 ]]
             }

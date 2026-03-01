@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine
@@ -47,8 +48,31 @@ class TelegramBot:
         self._buffer: deque[str] = deque(maxlen=200)
         self._running = False
         self._scraper_paused = False
+        # Repost context: short UUID key -> {community_id, community_url, token_name, token_symbol}
+        self._repost_context: dict[str, dict[str, str]] = {}
         # State machine for text input waiting
         self._waiting_for: dict[str, dict[str, str]] = {}
+
+    # ------------------------------------------------------------------
+    # Repost context helpers
+    # ------------------------------------------------------------------
+
+    def store_repost_context(
+        self,
+        community_id: str,
+        community_url: str,
+        token_name: str,
+        token_symbol: str,
+    ) -> str:
+        """Store repost context and return a short key for callback_data."""
+        key = uuid.uuid4().hex[:12]
+        self._repost_context[key] = {
+            "community_id": community_id,
+            "community_url": community_url,
+            "token_name": token_name,
+            "token_symbol": token_symbol,
+        }
+        return key
 
     # ------------------------------------------------------------------
     # Outbound messaging
@@ -1181,12 +1205,17 @@ class TelegramBot:
             )
             return
 
-        parts = cb_data.split(":", 4)
-        if len(parts) < 5:
-            await self._edit_message(chat_id, message_id, "Invalid repost data.", None, session)
+        # cb_data = "repost:<uuid_key>"
+        parts = cb_data.split(":", 1)
+        if len(parts) < 2 or parts[1] not in self._repost_context:
+            await self._edit_message(chat_id, message_id, "Repost context expired.", None, session)
             return
 
-        _, community_id, community_url, token_name, token_symbol = parts
+        ctx = self._repost_context[parts[1]]
+        community_id = ctx["community_id"]
+        community_url = ctx["community_url"]
+        token_name = ctx["token_name"]
+        token_symbol = ctx["token_symbol"]
 
         # Rotate to next valid account
         new_token = self._post_pool.rotate_account()
@@ -1220,6 +1249,11 @@ class TelegramBot:
             account = self._post_pool.get_current_account()
             token_preview = account["auth_token"][:8] if account else "???"
 
+            # Store new repost context for the retry button
+            repost_key = self.store_repost_context(
+                community_id, community_url, token_name, token_symbol
+            )
+
             if result["success"]:
                 tweet_url = result.get("tweet_url", "")
                 text = (
@@ -1231,7 +1265,7 @@ class TelegramBot:
                     "inline_keyboard": [[
                         {
                             "text": "Repost with different account",
-                            "callback_data": f"repost:{community_id}:{community_url}:{token_name}:{token_symbol}",
+                            "callback_data": f"repost:{repost_key}",
                         }
                     ]]
                 }
@@ -1246,7 +1280,7 @@ class TelegramBot:
                     "inline_keyboard": [[
                         {
                             "text": "Retry with different account",
-                            "callback_data": f"repost:{community_id}:{community_url}:{token_name}:{token_symbol}",
+                            "callback_data": f"repost:{repost_key}",
                         }
                     ]]
                 }
