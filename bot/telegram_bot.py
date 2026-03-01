@@ -46,6 +46,7 @@ class TelegramBot:
         self._start_time = datetime.now(timezone.utc)
         self._buffer: deque[str] = deque(maxlen=200)
         self._running = False
+        self._scraper_paused = False
         # State machine for text input waiting
         self._waiting_for: dict[str, dict[str, str]] = {}
 
@@ -302,15 +303,17 @@ class TelegramBot:
             if (self._post_pool and self._post_pool.is_enabled())
             else "🔄 Auto-Post: OFF"
         )
+        pause_label = "▶️ Resume All" if self._scraper_paused else "⏸ Pause All"
         return {
             "keyboard": [
-                ["📊 Status", "📋 Tasks"],
-                ["🔍 Scraper Tokens", "📝 Post Accounts"],
-                ["✍️ Post Texts", "🖼 Post Images"],
-                ["⚙️ Filters", "📤 Export"],
-                [auto_post_label],
+                [{"text": "📊 Status"}, {"text": "📋 Tasks"}],
+                [{"text": "🔍 Scraper Tokens"}, {"text": "📝 Post Accounts"}],
+                [{"text": "✍️ Post Texts"}, {"text": "🖼 Post Images"}],
+                [{"text": "⚙️ Filters"}, {"text": "📤 Export"}],
+                [{"text": auto_post_label}, {"text": pause_label}],
             ],
             "resize_keyboard": True,
+            "one_time_keyboard": False,
         }
 
     @staticmethod
@@ -728,6 +731,30 @@ class TelegramBot:
                 keyboard = self._main_keyboard_markup()
                 await self._send_with_markup(
                     chat_id, f"Auto-post is now {status}.", keyboard, session
+                )
+            return True
+
+        if text in ("⏸ Pause All", "▶️ Resume All"):
+            self._waiting_for.pop(chat_id, None)
+            if self._scraper_paused:
+                # Resume
+                resumed = self.db.resume_paused_tasks()
+                self._scraper_paused = False
+                keyboard = self._main_keyboard_markup()
+                await self._send_with_markup(
+                    chat_id,
+                    f"Scraper resumed. {resumed} task(s) re-queued.",
+                    keyboard, session,
+                )
+            else:
+                # Pause
+                paused = self.db.pause_all_pending()
+                self._scraper_paused = True
+                keyboard = self._main_keyboard_markup()
+                await self._send_with_markup(
+                    chat_id,
+                    f"Scraper paused. {paused} pending task(s) stopped.",
+                    keyboard, session,
                 )
             return True
 
