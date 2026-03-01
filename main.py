@@ -3,19 +3,21 @@
 
 Starts three concurrent components via ``asyncio``:
 1. **Alerter** — polls DexScreener API, sends Telegram alerts, enqueues scrape tasks.
-2. **Scraper** — processes the task queue, launches Playwright in a thread.
+2. **Scraper** — processes the task queue, launches Playwright in a subprocess.
 3. **Telegram bot** — command interface for status, export, manual control.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
 import sys
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Any
 
 import config as cfg
@@ -23,7 +25,6 @@ from alerter.filters import TokenFilter
 from alerter.monitor import DexScreenerMonitor, TokenMemory, extract_community_id
 from bot.telegram_bot import TelegramBot
 from database.db import Database
-from scraper.worker import scrape_community
 
 
 def _escape_md(text: str) -> str:
@@ -165,20 +166,54 @@ async def scraper_loop(db: Database, bot: TelegramBot) -> None:
                 await asyncio.sleep(60)
                 continue
 
-            # Run Playwright in a separate thread with hard timeout
+            # Run Playwright in a killable subprocess
+            result_file = cfg.DATA_DIR / f"task_result_{task_id}.json"
             try:
-                usernames, error = await asyncio.wait_for(
-                    asyncio.to_thread(scrape_community, community_url, auth_token),
-                    timeout=35 * 60,  # 35-min hard deadline (above worker's 30-min)
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, "-m", "scraper.runner",
+                    community_url, auth_token, str(task_id),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(cfg.BASE_DIR),
                 )
-            except asyncio.TimeoutError:
-                logger.error("Task #%d HARD TIMEOUT (35 min) — Playwright likely frozen", task_id)
-                usernames, error = [], "main loop timeout (35 min) — Playwright frozen"
-                # Kill any orphaned playwright/chromium processes
-                import subprocess
-                subprocess.run(["pkill", "-f", "chromium.*--disable-gpu"], capture_output=True)
+                try:
+                    stdout, stderr = await asyncio.wait_for(
+                        proc.communicate(), timeout=35 * 60,
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    logger.error(
+                        "Task #%d KILLED after 35-min timeout (pid %d)",
+                        task_id, proc.pid,
+                    )
+                    usernames, error = [], "subprocess timeout (35 min) — process killed"
+                else:
+                    # Log subprocess output
+                    if stdout:
+                        for line in stdout.decode(errors="replace").splitlines():
+                            logger.info("[runner:%d] %s", task_id, line)
+                    if stderr:
+                        for line in stderr.decode(errors="replace").splitlines():
+                            logger.warning("[runner:%d] %s", task_id, line)
+
+                    # Read result JSON
+                    if result_file.exists():
+                        data = json.loads(result_file.read_text(encoding="utf-8"))
+                        usernames = data.get("usernames", [])
+                        error = data.get("error")
+                    elif proc.returncode != 0:
+                        usernames, error = [], f"runner exited with code {proc.returncode}"
+                    else:
+                        usernames, error = [], "runner produced no result file"
             except Exception as exc:
                 usernames, error = [], str(exc)
+            finally:
+                # Clean up result file
+                try:
+                    result_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
             if error == "auth_token_invalid":
                 _auth_invalid = True
