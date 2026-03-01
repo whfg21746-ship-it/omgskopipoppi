@@ -90,6 +90,16 @@ class TelegramBot:
                 if resp.status == 200:
                     return True
                 err = await resp.text()
+                # Fallback: if Markdown parsing failed, retry as plain text
+                if resp.status == 400 and "can't parse entities" in err:
+                    logger.warning("Markdown parse failed for %s, retrying as plain text", chat_id)
+                    payload.pop("parse_mode")
+                    async with session.post(url, json=payload) as resp2:
+                        if resp2.status == 200:
+                            return True
+                        err2 = await resp2.text()
+                        logger.error("Telegram send (plain) %s (%d): %s", chat_id, resp2.status, err2)
+                        return False
                 logger.error("Telegram send %s (%d): %s", chat_id, resp.status, err)
                 return False
         except Exception as exc:
@@ -394,6 +404,18 @@ class TelegramBot:
         """Long-poll Telegram getUpdates forever."""
         self._running = True
         logger.info("Telegram bot polling started")
+
+        # Delete any leftover webhook to prevent 409 conflict with getUpdates
+        wh_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as sess:
+                async with sess.post(wh_url, json={"drop_pending_updates": False}) as resp:
+                    logger.info("deleteWebhook: %d", resp.status)
+        except Exception as exc:
+            logger.warning("deleteWebhook failed: %s", exc)
+
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
 
         while self._running:

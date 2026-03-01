@@ -165,11 +165,18 @@ async def scraper_loop(db: Database, bot: TelegramBot) -> None:
                 await asyncio.sleep(60)
                 continue
 
-            # Run Playwright in a separate thread
+            # Run Playwright in a separate thread with hard timeout
             try:
-                usernames, error = await asyncio.to_thread(
-                    scrape_community, community_url, auth_token
+                usernames, error = await asyncio.wait_for(
+                    asyncio.to_thread(scrape_community, community_url, auth_token),
+                    timeout=35 * 60,  # 35-min hard deadline (above worker's 30-min)
                 )
+            except asyncio.TimeoutError:
+                logger.error("Task #%d HARD TIMEOUT (35 min) — Playwright likely frozen", task_id)
+                usernames, error = [], "main loop timeout (35 min) — Playwright frozen"
+                # Kill any orphaned playwright/chromium processes
+                import subprocess
+                subprocess.run(["pkill", "-f", "chromium.*--disable-gpu"], capture_output=True)
             except Exception as exc:
                 usernames, error = [], str(exc)
 
