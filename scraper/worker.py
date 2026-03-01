@@ -427,6 +427,24 @@ def scrape_community(
         except Exception as exc:
             logger.debug("Could not check for error pages: %s", exc)
 
+        # --- Step 4b: Detect deleted/unavailable community ---
+        try:
+            body_text_check = page.evaluate(
+                "document.body ? document.body.innerText.substring(0, 2000) : ''"
+            )
+            deleted_markers = [
+                "This Community has been deleted",
+                "This community is unavailable",
+                "This Community doesn't exist",
+            ]
+            for marker in deleted_markers:
+                if marker.lower() in body_text_check.lower():
+                    logger.warning("Community deleted/unavailable: found '%s'", marker)
+                    _save_debug_screenshot(page, "community_deleted")
+                    return [], "community_deleted"
+        except Exception as exc:
+            logger.debug("Could not check for deleted community: %s", exc)
+
         # --- Step 5: Dismiss cookie banner if present ---
         try:
             if page.is_visible('text="Accept all cookies"', timeout=2000):
@@ -448,7 +466,19 @@ def scrape_community(
         logger.info("Starting scroll-and-collect phase...")
         usernames = _scroll_and_collect(page, deadline)
 
-        # --- Step 8: Compare and warn ---
+        # --- Step 8: Detect deleted community (heuristic: title="X" + 0 usernames) ---
+        try:
+            page_title = page.title().strip()
+            if page_title == "X" and len(usernames) == 0:
+                logger.warning(
+                    "Community appears deleted: page title is bare 'X' and 0 usernames collected"
+                )
+                _save_debug_screenshot(page, "community_deleted_heuristic")
+                return [], "community_deleted"
+        except Exception:
+            pass
+
+        # --- Step 9: Compare and warn ---
         if expected and len(usernames) > 0:
             ratio = len(usernames) / expected
             if ratio < 0.8:

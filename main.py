@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Unified DexScreener Alerter + X Community Scraper service.
+"""Unified DexScreener Alerter + X Community Scraper + Auto-Poster service.
 
 Starts three concurrent components via ``asyncio``:
 1. **Alerter** — polls DexScreener API, sends Telegram alerts, enqueues scrape tasks.
 2. **Scraper** — processes the task queue, launches Playwright in a subprocess.
 3. **Telegram bot** — command interface for status, export, manual control.
+4. **Auto-poster** — posts to X communities on new token alerts (parallel task).
 """
 
 from __future__ import annotations
@@ -25,6 +26,8 @@ from alerter.filters import TokenFilter
 from alerter.monitor import DexScreenerMonitor, TokenMemory, extract_community_id
 from bot.telegram_bot import TelegramBot
 from database.db import Database
+from poster.post_pool import PostPool
+from poster.worker import post_to_community
 from token_pool import TokenPool
 
 # ---------------------------------------------------------------------------
@@ -71,6 +74,7 @@ logger = setup_logging()
 _bot: TelegramBot | None = None
 _db: Database | None = None
 _pool: TokenPool | None = None
+_post_pool: PostPool | None = None
 _all_tokens_dead = False  # when True, scraper_loop sleeps until new token
 
 # Adaptive timeout: starts at 15 min, grows +5 on timeout, max 30, resets on success
@@ -111,6 +115,91 @@ async def on_new_task(
     )
     if task_id:
         logger.info("Scrape task #%d created for community %s", task_id, community_id)
+
+    # --- Launch auto-posting as a parallel task (NEVER blocks alerter) ---
+    if (
+        _post_pool is not None
+        and _post_pool.is_enabled()
+        and _post_pool.has_accounts()
+        and _post_pool.has_tweets()
+        and _bot is not None
+    ):
+        # Extract token_symbol from token_name like "TokenName ($SYM)"
+        t_name = token_name or ""
+        t_symbol = ""
+        sym_match = re.search(r'\(\$([^)]+)\)', t_name)
+        if sym_match:
+            t_symbol = sym_match.group(1)
+
+        asyncio.create_task(
+            run_auto_post(community_id, community_url, t_name, t_symbol, _post_pool, _bot)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Auto-posting
+# ---------------------------------------------------------------------------
+
+
+async def run_auto_post(
+    community_id: str,
+    community_url: str,
+    token_name: str,
+    token_symbol: str,
+    post_pool: PostPool,
+    bot: TelegramBot,
+) -> None:
+    """Run auto-posting in background. ALL errors caught — never crashes main loop."""
+    try:
+        await asyncio.sleep(post_pool.delay)
+        result = await asyncio.to_thread(
+            post_to_community,
+            community_id,
+            community_url,
+            token_name,
+            token_symbol,
+            post_pool,
+        )
+
+        account_index = result.get("account_index", -1)
+        account = post_pool.get_current_account()
+        token_preview = account["auth_token"][:8] if account else "???"
+
+        if result["success"]:
+            tweet_id = result["tweet_id"]
+            tweet_url = result.get("tweet_url", "")
+            msg = (
+                f"Posted in {token_name} community!\n"
+                f"Link: {tweet_url}\n"
+                f"Account: #{account_index} ({token_preview}...)"
+            )
+            reply_markup = {
+                "inline_keyboard": [[
+                    {
+                        "text": "Repost with different account",
+                        "callback_data": f"repost:{community_id}:{community_url}:{token_name}:{token_symbol}",
+                    }
+                ]]
+            }
+            await bot.broadcast_with_markup(msg, reply_markup)
+        else:
+            error = result.get("error", "unknown error")
+            msg = (
+                f"Failed to post in {token_name}: {error}\n"
+                f"Account: #{account_index} ({token_preview}...)"
+            )
+            reply_markup = {
+                "inline_keyboard": [[
+                    {
+                        "text": "Retry with different account",
+                        "callback_data": f"repost:{community_id}:{community_url}:{token_name}:{token_symbol}",
+                    }
+                ]]
+            }
+            await bot.broadcast_with_markup(msg, reply_markup)
+
+    except Exception as exc:
+        logger.error("Auto-post error (non-fatal): %s", exc, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +302,7 @@ async def scraper_loop(db: Database, bot: TelegramBot, pool: TokenPool) -> None:
                 if new_token:
                     valid_left = pool.count_valid()
                     await bot.broadcast(
-                        f"⚠️ Token {old_label} expired. "
+                        f"Token {old_label} expired. "
                         f"Switching to {pool.current_label()}. "
                         f"Valid tokens left: {valid_left}"
                     )
@@ -231,6 +320,16 @@ async def scraper_loop(db: Database, bot: TelegramBot, pool: TokenPool) -> None:
                     await _alert_all_tokens_dead(bot, pool)
                     continue
 
+            # --- Handle community_deleted: skip gracefully ---
+            if error == "community_deleted":
+                db.mark_task_failed(task_id, "community_deleted")
+                await bot.broadcast(
+                    f"{token_name} -- community was deleted/unavailable. Skipped."
+                )
+                logger.info("Task #%d: community deleted, skipped", task_id)
+                # Do NOT escalate timeout for deleted communities
+                continue
+
             # --- Adaptive timeout ---
             if timed_out:
                 current_timeout = min(current_timeout + _TIMEOUT_STEP, _MAX_TIMEOUT)
@@ -239,7 +338,7 @@ async def scraper_loop(db: Database, bot: TelegramBot, pool: TokenPool) -> None:
             if error:
                 db.mark_task_failed(task_id, error)
                 await bot.broadcast(
-                    f"❌ Scrape failed for {token_name}:\n{error}"
+                    f"Scrape failed for {token_name}:\n{error}"
                 )
                 logger.error("Task #%d failed: %s", task_id, error)
                 await asyncio.sleep(120)
@@ -250,7 +349,7 @@ async def scraper_loop(db: Database, bot: TelegramBot, pool: TokenPool) -> None:
             saved = db.save_usernames(task_id, community_id, usernames)
             db.mark_task_completed(task_id, len(usernames))
             await bot.broadcast(
-                f"✅ Scraped {token_name}: "
+                f"Scraped {token_name}: "
                 f"{len(usernames)} usernames ({saved} new)"
             )
             logger.info(
@@ -270,8 +369,8 @@ async def _alert_all_tokens_dead(bot: TelegramBot, pool: TokenPool) -> None:
     global _all_tokens_dead
     _all_tokens_dead = True
     msg = (
-        "🚨🚨🚨 ALL TOKENS EXPIRED! Scraper STOPPED.\n"
-        "Send new tokens via /token 🚨🚨🚨"
+        "ALL TOKENS EXPIRED! Scraper STOPPED.\n"
+        "Send new tokens via /token or use Scraper Tokens menu."
     )
     for i in range(3):
         await bot.broadcast(msg)
@@ -331,10 +430,10 @@ async def on_update_tokens_bulk(values: list[str]) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global _bot, _db, _pool
+    global _bot, _db, _pool, _post_pool
 
     logger.info("=" * 60)
-    logger.info("DexScreener + X Scraper Service starting")
+    logger.info("DexScreener + X Scraper + Auto-Poster Service starting")
     logger.info("=" * 60)
 
     # Initialize shared components
@@ -344,6 +443,9 @@ async def main() -> None:
     pool = TokenPool()
     _pool = pool
 
+    post_pool = PostPool()
+    _post_pool = post_pool
+
     token_filter = TokenFilter()
     memory = TokenMemory()
 
@@ -351,6 +453,7 @@ async def main() -> None:
         db=db,
         token_filter=token_filter,
         token_pool=pool,
+        post_pool=post_pool,
         on_add_community=on_add_community,
         on_update_token=on_update_token,
         on_update_tokens_bulk=on_update_tokens_bulk,
@@ -367,15 +470,15 @@ async def main() -> None:
     # Startup notification
     token_info = pool.summary()
     await bot.broadcast(
-        f"🚀 Service started!\n\n"
+        f"Service started!\n\n"
         f"Filters:\n{token_filter.summary()}\n\n"
         f"{token_info}\n\n"
-        f"Send /help for commands."
+        f"Send /menu for control panel."
     )
 
     if not pool.has_valid():
         await bot.broadcast(
-            "⚠️ No valid auth tokens! Send tokens via /token"
+            "No valid auth tokens! Send tokens via /token or use Scraper Tokens menu."
         )
 
     # Run all loops concurrently
