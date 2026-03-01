@@ -309,16 +309,23 @@ class XPoster:
             "command": "FINALIZE",
             "media_id": media_id,
         }
+        r_fin = None
         for attempt in range(3):
             try:
                 r_fin = session.post(upload_url, headers=headers, data=finalize_params)
-                logger.info("Media FINALIZE: status=%d", r_fin.status_code)
                 break
             except Exception as exc:
                 if attempt == 2:
-                    logger.error("Media FINALIZE failed after 3 attempts: %s", exc)
+                    logger.error("Media FINALIZE request failed after 3 attempts: %s", exc)
                     return None
                 time.sleep(1)
+
+        fin_body = r_fin.text[:500] if r_fin.text else "(empty)"
+        logger.info("Media FINALIZE: status=%d, body=%s", r_fin.status_code, fin_body)
+
+        if r_fin.status_code not in (200, 201, 202):
+            logger.error("Media FINALIZE failed: status=%d, body=%s", r_fin.status_code, fin_body)
+            return None
 
         return media_id
 
