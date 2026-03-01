@@ -172,12 +172,12 @@ class XPoster:
             path="/i/api/graphql/D9qc0aITr1vnjAzG_Il-6Q/CreateTweet",
         )
         logger.info(
-            "CreateTweet: community_id=%s, media_id=%s, text=%s",
-            community_id, media_id, text[:80],
+            "CreateTweet FULL PAYLOAD:\n%s",
+            json.dumps(payload, indent=2, ensure_ascii=False),
         )
         resp = session.post(url, headers=headers, json=payload)
         data = resp.json()
-        logger.info("CreateTweet response: status=%d, body=%s", resp.status_code, str(data)[:300])
+        logger.info("CreateTweet response: status=%d, body=%s", resp.status_code, json.dumps(data, ensure_ascii=False)[:500])
         return data
 
     @staticmethod

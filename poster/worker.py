@@ -103,7 +103,7 @@ def post_to_community(
             pass
 
         if tweet_id:
-            tweet_url = f"https://x.com/i/communities/{community_id}/status/{tweet_id}"
+            tweet_url = f"https://x.com/i/status/{tweet_id}"
             logger.info("Tweet posted successfully: %s", tweet_url)
             return {
                 "success": True,
