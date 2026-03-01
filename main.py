@@ -117,6 +117,17 @@ async def on_new_task(
         logger.info("Scrape task #%d created for community %s", task_id, community_id)
 
     # --- Launch auto-posting as a parallel task (NEVER blocks alerter) ---
+
+    # Debug: log every sub-condition so we can see exactly what blocks auto-post
+    logger.info(
+        "AUTO-POST CHECK: post_pool=%s, enabled=%s, has_accounts=%s, has_tweets=%s, bot=%s",
+        _post_pool is not None,
+        _post_pool.is_enabled() if _post_pool else "N/A",
+        _post_pool.has_accounts() if _post_pool else "N/A",
+        _post_pool.has_tweets() if _post_pool else "N/A",
+        _bot is not None,
+    )
+
     if (
         _post_pool is not None
         and _post_pool.is_enabled()
@@ -131,8 +142,22 @@ async def on_new_task(
         if sym_match:
             t_symbol = sym_match.group(1)
 
+        # The monitor passes members_url (ending in /members) as community_url.
+        # Strip /members suffix for the poster — tweet templates use {community_url}
+        # and it should link to the community page, not the members list.
+        base_community_url = re.sub(r'/members/?$', '', community_url)
+
+        logger.info(
+            "AUTO-POST: launching for community %s (token=%s)",
+            community_id, t_name,
+        )
         asyncio.create_task(
-            run_auto_post(community_id, community_url, t_name, t_symbol, _post_pool, _bot)
+            run_auto_post(community_id, base_community_url, t_name, t_symbol, _post_pool, _bot)
+        )
+    else:
+        logger.warning(
+            "AUTO-POST SKIPPED for %s: conditions not met (see CHECK log above)",
+            community_id,
         )
 
 
