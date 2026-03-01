@@ -54,6 +54,24 @@ class TokenFilter:
         self.filters[key] = value
         self.save()
 
+    def update_mcap(self, min_mcap: float, max_mcap: float) -> None:
+        self.filters["min_mcap"] = min_mcap
+        self.filters["max_mcap"] = max_mcap
+        self.save()
+
+    def update_liquidity(self, min_liquidity: float) -> None:
+        self.filters["min_liquidity"] = min_liquidity
+        self.save()
+
+    def update_chains(self, chains: list[str]) -> None:
+        self.filters["chains"] = chains
+        self.save()
+
+    def update_age(self, min_minutes: int, max_hours: int) -> None:
+        self.filters["min_age_minutes"] = min_minutes
+        self.filters["max_age_hours"] = max_hours
+        self.save()
+
     # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------

@@ -12,6 +12,7 @@ from typing import Any, Callable, Coroutine
 
 import aiohttp
 
+from alerter.filters import TokenFilter
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_USER_IDS
 from database.db import Database
 
@@ -24,11 +25,13 @@ class TelegramBot:
     def __init__(
         self,
         db: Database,
+        token_filter: TokenFilter | None = None,
         on_retry_task: Callable[[int], Coroutine[Any, Any, None]] | None = None,
         on_add_community: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         on_update_token: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     ) -> None:
         self.db = db
+        self._filter = token_filter
         self._on_retry = on_retry_task
         self._on_add = on_add_community
         self._on_update_token = on_update_token
@@ -147,6 +150,8 @@ class TelegramBot:
             await self._cmd_add(chat_id, arg, session)
         elif cmd == "/token":
             await self._cmd_token(chat_id, arg, session)
+        elif cmd == "/filters":
+            await self._cmd_filters(chat_id, arg, session)
         else:
             await self._send(chat_id, "Unknown command. Send /help", session)
 
@@ -161,7 +166,12 @@ class TelegramBot:
             "/export\\_all — export ALL usernames\n"
             "/retry `<task_id>` — re-run a failed task\n"
             "/add `<community_url>` — manually add a community\n"
-            "/token `<auth_token>` — update X auth token at runtime"
+            "/token `<auth_token>` — update X auth token at runtime\n"
+            "/filters — show/change filters\n"
+            "  /filters mcap `<min>` `<max>`\n"
+            "  /filters liquidity `<min>`\n"
+            "  /filters chains `<c1,c2>`\n"
+            "  /filters age `<min_min>` `<max_h>`"
         )
         await self._send(cid, msg, s)
 
@@ -321,6 +331,54 @@ class TelegramBot:
 
         reply = f"auth\\_token updated.  {resumed} paused task(s) re-queued."
         await self._send(cid, reply, s)
+
+    # --- /filters ---
+
+    async def _cmd_filters(
+        self, cid: str, arg: str, s: aiohttp.ClientSession
+    ) -> None:
+        if self._filter is None:
+            await self._send(cid, "Filters not configured.", s)
+            return
+
+        # No args — show current filters
+        if not arg:
+            await self._send(cid, f"*Current filters:*\n{self._filter.summary()}", s)
+            return
+
+        parts = arg.split()
+        subcmd = parts[0].lower()
+
+        try:
+            if subcmd == "mcap" and len(parts) == 3:
+                min_v, max_v = float(parts[1]), float(parts[2])
+                self._filter.update_mcap(min_v, max_v)
+            elif subcmd == "liquidity" and len(parts) == 2:
+                self._filter.update_liquidity(float(parts[1]))
+            elif subcmd == "chains" and len(parts) == 2:
+                chains = [c.strip() for c in parts[1].split(",") if c.strip()]
+                self._filter.update_chains(chains)
+            elif subcmd == "age" and len(parts) == 3:
+                self._filter.update_age(int(parts[1]), int(parts[2]))
+            else:
+                await self._send(
+                    cid,
+                    "Usage:\n"
+                    "/filters — show current\n"
+                    "/filters mcap `<min>` `<max>`\n"
+                    "/filters liquidity `<min>`\n"
+                    "/filters chains `<c1,c2>`\n"
+                    "/filters age `<min_minutes>` `<max_hours>`",
+                    s,
+                )
+                return
+        except (ValueError, IndexError):
+            await self._send(cid, "Invalid values. Check numbers and try again.", s)
+            return
+
+        await self._send(
+            cid, f"Filters updated:\n{self._filter.summary()}", s
+        )
 
     # ------------------------------------------------------------------
     # Main polling loop

@@ -265,6 +265,7 @@ async def main() -> None:
 
     bot = TelegramBot(
         db=db,
+        token_filter=token_filter,
         on_retry_task=None,
         on_add_community=on_add_community,
         on_update_token=on_update_token,
