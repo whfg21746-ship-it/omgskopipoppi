@@ -467,13 +467,13 @@ async def main() -> None:
         on_new_task=on_new_task,
     )
 
-    # Startup notification
+    # Startup notification — send with persistent keyboard
     token_info = pool.summary()
-    await bot.broadcast(
+    await bot.broadcast_main_keyboard(
         f"Service started!\n\n"
         f"Filters:\n{token_filter.summary()}\n\n"
         f"{token_info}\n\n"
-        f"Send /menu for control panel."
+        f"Use the keyboard below or send /menu."
     )
 
     if not pool.has_valid():

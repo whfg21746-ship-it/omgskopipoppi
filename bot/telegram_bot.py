@@ -79,6 +79,11 @@ class TelegramBot:
             for uid in TELEGRAM_USER_IDS:
                 await self._send_with_markup(uid, text, reply_markup, session)
 
+    async def broadcast_main_keyboard(self, text: str) -> None:
+        """Broadcast text with the persistent reply keyboard to all users."""
+        markup = self._main_keyboard_markup()
+        await self.broadcast_with_markup(text, markup)
+
     async def _flush_buffer(self, session: aiohttp.ClientSession) -> None:
         while self._buffer:
             msg = self._buffer[0]
@@ -290,6 +295,24 @@ class TelegramBot:
             ]
         }
 
+    def _main_keyboard_markup(self) -> dict:
+        """Build the persistent reply keyboard (always visible at bottom of chat)."""
+        auto_post_label = (
+            "🔄 Auto-Post: ON"
+            if (self._post_pool and self._post_pool.is_enabled())
+            else "🔄 Auto-Post: OFF"
+        )
+        return {
+            "keyboard": [
+                ["📊 Status", "📋 Tasks"],
+                ["🔍 Scraper Tokens", "📝 Post Accounts"],
+                ["✍️ Post Texts", "🖼 Post Images"],
+                ["⚙️ Filters", "📤 Export"],
+                [auto_post_label],
+            ],
+            "resize_keyboard": True,
+        }
+
     @staticmethod
     def _back_button() -> list[dict]:
         return [{"text": "Back to Menu", "callback_data": "menu"}]
@@ -336,7 +359,7 @@ class TelegramBot:
     # --- /menu (main menu) ---
 
     async def _cmd_menu(self, cid: str, s: aiohttp.ClientSession) -> None:
-        markup = self._main_menu_markup(self._post_pool)
+        markup = self._main_keyboard_markup()
         await self._send_with_markup(cid, "Control Panel", markup, s)
 
     # --- /status ---
@@ -562,6 +585,155 @@ class TelegramBot:
         await self._send_plain(cid, f"Filters updated:\n{self._filter.summary()}", s)
 
     # ------------------------------------------------------------------
+    # Persistent keyboard button handler
+    # ------------------------------------------------------------------
+
+    async def _handle_keyboard_button(
+        self, text: str, chat_id: str, session: aiohttp.ClientSession
+    ) -> bool:
+        """Handle persistent keyboard button presses. Returns True if handled."""
+
+        if text == "📊 Status":
+            self._waiting_for.pop(chat_id, None)
+            msg = self._build_status_text()
+            await self._send_plain(chat_id, msg, session)
+            return True
+
+        if text == "📋 Tasks":
+            self._waiting_for.pop(chat_id, None)
+            msg = self._build_tasks_text()
+            await self._send_plain(chat_id, msg, session)
+            return True
+
+        if text == "🔍 Scraper Tokens":
+            self._waiting_for.pop(chat_id, None)
+            summary = self._pool.summary() if self._pool else "Token pool not configured."
+            markup = {"inline_keyboard": [
+                [
+                    {"text": "Add Token", "callback_data": "scraper_tokens:add"},
+                    {"text": "Upload .txt", "callback_data": "scraper_tokens:upload"},
+                ],
+                [
+                    {"text": "Clear Invalid", "callback_data": "scraper_tokens:clear_invalid"},
+                    {"text": "Clear All", "callback_data": "scraper_tokens:clear_all"},
+                ],
+                self._back_button(),
+            ]}
+            await self._send_with_markup(chat_id, summary, markup, session)
+            return True
+
+        if text == "📝 Post Accounts":
+            self._waiting_for.pop(chat_id, None)
+            summary = self._post_pool.accounts_summary() if self._post_pool else "Post pool not configured."
+            markup = {"inline_keyboard": [
+                [
+                    {"text": "Add Account", "callback_data": "post_accounts:add"},
+                    {"text": "Upload .txt", "callback_data": "post_accounts:upload"},
+                ],
+                [
+                    {"text": "Clear Invalid", "callback_data": "post_accounts:clear_invalid"},
+                    {"text": "Clear All", "callback_data": "post_accounts:clear_all"},
+                ],
+                self._back_button(),
+            ]}
+            await self._send_with_markup(chat_id, summary, markup, session)
+            return True
+
+        if text == "✍️ Post Texts":
+            self._waiting_for.pop(chat_id, None)
+            tweets = self._post_pool.list_tweets() if self._post_pool else []
+            if tweets:
+                lines = ["Current tweet templates:\n"]
+                for i, t in enumerate(tweets):
+                    lines.append(f"{i + 1}. {t}")
+                msg = "\n".join(lines)
+            else:
+                msg = "No tweet templates configured."
+            markup = {"inline_keyboard": [
+                [
+                    {"text": "Add Text", "callback_data": "post_texts:add"},
+                    {"text": "Upload .txt", "callback_data": "post_texts:upload"},
+                ],
+                [
+                    {"text": "Clear All", "callback_data": "post_texts:clear_all"},
+                ],
+                self._back_button(),
+            ]}
+            await self._send_with_markup(chat_id, msg, markup, session)
+            return True
+
+        if text == "🖼 Post Images":
+            self._waiting_for.pop(chat_id, None)
+            if self._post_pool:
+                images = self._post_pool.list_images()
+                use_photo = self._post_pool.use_photo
+                msg = f"Images: {len(images)} file(s)\nUse photos: {'ON' if use_photo else 'OFF'}"
+            else:
+                msg = "Post pool not configured."
+                use_photo = False
+            photo_label = "Use Photos: ON" if use_photo else "Use Photos: OFF"
+            markup = {"inline_keyboard": [
+                [
+                    {"text": "Upload Image", "callback_data": "post_images:upload"},
+                    {"text": "Clear All", "callback_data": "post_images:clear_all"},
+                ],
+                [
+                    {"text": photo_label, "callback_data": "post_images:toggle_photo"},
+                ],
+                self._back_button(),
+            ]}
+            await self._send_with_markup(chat_id, msg, markup, session)
+            return True
+
+        if text == "⚙️ Filters":
+            self._waiting_for.pop(chat_id, None)
+            msg = (
+                f"Current filters:\n{self._filter.summary()}"
+                if self._filter
+                else "Filters not configured."
+            )
+            markup = {"inline_keyboard": [
+                [
+                    {"text": "MCap", "callback_data": "filters:mcap"},
+                    {"text": "Liquidity", "callback_data": "filters:liquidity"},
+                ],
+                [
+                    {"text": "Chains", "callback_data": "filters:chains"},
+                    {"text": "Age", "callback_data": "filters:age"},
+                ],
+                self._back_button(),
+            ]}
+            await self._send_with_markup(chat_id, msg, markup, session)
+            return True
+
+        if text == "📤 Export":
+            self._waiting_for.pop(chat_id, None)
+            markup = {"inline_keyboard": [
+                [
+                    {"text": "All Usernames", "callback_data": "export:all"},
+                    {"text": "By Community", "callback_data": "export:community"},
+                ],
+                self._back_button(),
+            ]}
+            await self._send_with_markup(chat_id, "Export options:", markup, session)
+            return True
+
+        if text.startswith("🔄 Auto-Post:"):
+            self._waiting_for.pop(chat_id, None)
+            if self._post_pool:
+                new_val = not self._post_pool.is_enabled()
+                self._post_pool.set_enabled(new_val)
+                status = "ON" if new_val else "OFF"
+                # Send with updated reply keyboard to reflect new label
+                keyboard = self._main_keyboard_markup()
+                await self._send_with_markup(
+                    chat_id, f"Auto-post is now {status}.", keyboard, session
+                )
+            return True
+
+        return False
+
+    # ------------------------------------------------------------------
     # Callback query handler (inline buttons)
     # ------------------------------------------------------------------
 
@@ -582,12 +754,14 @@ class TelegramBot:
 
         await self._answer_callback(cb_id, "", session)
 
-        # --- Main menu ---
+        # --- Main menu (back from submenu) ---
         if cb_data == "menu":
             # Clear any waiting state when returning to menu
             self._waiting_for.pop(chat_id, None)
-            markup = self._main_menu_markup(self._post_pool)
-            await self._edit_message(chat_id, message_id, "Control Panel", markup, session)
+            await self._edit_message(
+                chat_id, message_id, "Control Panel — use keyboard below.",
+                {"inline_keyboard": []}, session,
+            )
 
         # --- Status ---
         elif cb_data == "status":
@@ -934,17 +1108,16 @@ class TelegramBot:
                 session,
             )
 
-        # --- Toggle Auto-Post ---
+        # --- Toggle Auto-Post (legacy inline callback) ---
         elif cb_data == "toggle_autopost":
             if self._post_pool:
                 new_val = not self._post_pool.is_enabled()
                 self._post_pool.set_enabled(new_val)
                 status = "ON" if new_val else "OFF"
-                markup = self._main_menu_markup(self._post_pool)
                 await self._edit_message(
                     chat_id, message_id,
-                    f"Auto-post is now {status}.\n\nControl Panel",
-                    markup, session,
+                    f"Auto-post is now {status}.",
+                    {"inline_keyboard": []}, session,
                 )
 
         # --- Add Community ---
@@ -1432,7 +1605,20 @@ class TelegramBot:
 
                         text = msg.get("text", "")
 
-                        # Check waiting states first (for inline button text input)
+                        # Check persistent keyboard buttons first
+                        if text and not text.startswith("/"):
+                            try:
+                                kb_handled = await self._handle_keyboard_button(
+                                    text, chat_id, session
+                                )
+                                if kb_handled:
+                                    continue
+                            except Exception as exc:
+                                logger.error("Keyboard button handler error: %s", exc, exc_info=True)
+                                await self._send_plain(chat_id, f"Error: {exc}", session)
+                                continue
+
+                        # Check waiting states (for inline button text input)
                         if text and not text.startswith("/"):
                             try:
                                 consumed = await self._handle_waiting_input(text, chat_id, session)
