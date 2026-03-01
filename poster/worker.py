@@ -53,8 +53,8 @@ def post_to_community(
         logger.info("Joining community %s...", community_id)
         XPoster.join_community(session, ct0, auth_token, xtid, community_id)
 
-        # 4. Wait 3-5 seconds (randomized)
-        wait = random.uniform(3, 5)
+        # 4. Wait 8-12 seconds (randomized — community join needs time to propagate)
+        wait = random.uniform(8, 12)
         logger.info("Waiting %.1f seconds before posting...", wait)
         time.sleep(wait)
 
@@ -72,6 +72,11 @@ def post_to_community(
         text = template.replace("{token_name}", token_name)
         text = text.replace("{token_symbol}", token_symbol)
         text = text.replace("{community_url}", community_url)
+
+        # Add random emoji suffix to prevent duplicate tweet error 187
+        _EMOJIS = ['🔥', '🚀', '💎', '⚡', '💪', '🌙', '📈', '💰', '🎯', '✨']
+        text = text + ' ' + ''.join(random.sample(_EMOJIS, 2))
+        logger.info("Final tweet text: %s", text)
 
         # 6. Upload media if enabled (fall back to text-only on failure)
         media_id = None

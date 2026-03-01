@@ -3,14 +3,20 @@
 Uses curl_cffi for Chrome impersonation and XClientTransaction for
 transaction ID generation. All methods are synchronous — designed to
 be called from ``asyncio.to_thread()``.
+
+Rewritten to match the exact headers, payloads, and API call patterns
+from the working community booster reference implementation.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import time
 from typing import Any
 
+import curl_cffi
 from curl_cffi import CurlMime
 from curl_cffi import requests as curl_requests
 
@@ -21,44 +27,56 @@ _BEARER = (
     "%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
 )
 
-_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
-)
-
 
 class XPoster:
     """Handles X GraphQL API interactions for posting in communities."""
 
-    @staticmethod
-    def _common_headers(ct0: str, auth_token: str) -> dict[str, str]:
-        return {
-            "Authorization": _BEARER,
-            "Cookie": f"ct0={ct0};auth_token={auth_token}",
-            "x-csrf-token": ct0,
-            "x-twitter-active-user": "yes",
-            "x-twitter-auth-type": "OAuth2Session",
-            "x-twitter-client-language": "en",
-            "Content-Type": "application/json",
-            "User-Agent": _UA,
-        }
+    # ------------------------------------------------------------------
+    # ct0 token
+    # ------------------------------------------------------------------
 
     @staticmethod
     def get_ct0(session: curl_requests.Session, auth_token: str) -> str:
-        """Obtain a ct0 CSRF token by hitting update_profile.json."""
+        """Obtain a ct0 CSRF token by hitting update_profile.json on twitter.com."""
         headers = {
-            "User-Agent": _UA,
+            "Host": "twitter.com",
+            "sec-ch-ua": '"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
+            "Sec-Ch-Ua-Mobile": "?1",
+            "Sec-Ch-Ua-Platform": '"Android"',
+            "Upgrade-Insecure-Requests": "1",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-User": "?1",
+            "Sec-Fetch-Dest": "document",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Priority": "u=0, i",
             "Cookie": f"auth_token={auth_token};",
         }
-        session.post(
-            "https://twitter.com/i/api/1.1/account/update_profile.json",
-            headers=headers,
-        )
-        ct0 = session.cookies.get("ct0", "")
+        for attempt in range(3):
+            try:
+                session.post(
+                    "https://twitter.com/i/api/1.1/account/update_profile.json",
+                    headers=headers,
+                )
+                ct0 = session.cookies.get("ct0", "")
+                if ct0:
+                    break
+            except Exception:
+                if attempt == 2:
+                    raise RuntimeError("Failed to obtain ct0 token after 3 attempts")
+                time.sleep(1)
+
         if not ct0:
             raise RuntimeError("Failed to obtain ct0 token")
         logger.info("Obtained ct0 token: %s...", ct0[:12])
         return ct0
+
+    # ------------------------------------------------------------------
+    # XClientTransaction ID generator
+    # ------------------------------------------------------------------
 
     @staticmethod
     def get_transaction_id() -> Any:
@@ -67,8 +85,25 @@ class XPoster:
         from x_client_transaction import ClientTransaction
         from x_client_transaction.utils import get_ondemand_file_url
 
-        basic_headers = {"User-Agent": _UA}
-        home_page = curl_requests.get("https://x.com", headers=basic_headers)
+        headers = {
+            "Authority": "x.com",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Referer": "https://x.com",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+            "X-Twitter-Active-User": "yes",
+            "X-Twitter-Client-Language": "en",
+        }
+        home_page = None
+        for attempt in range(3):
+            try:
+                home_page = curl_requests.get("https://x.com", headers=headers)
+                break
+            except Exception:
+                if attempt == 2:
+                    raise RuntimeError("Failed to fetch x.com after 3 attempts")
+                time.sleep(1)
+
         home_page_response = BeautifulSoup(home_page.content, "html.parser")
         ondemand_file_url = get_ondemand_file_url(response=home_page_response)
         ondemand_file = curl_requests.get(url=ondemand_file_url)
@@ -78,6 +113,10 @@ class XPoster:
         )
         logger.info("XClientTransaction initialized")
         return xtid
+
+    # ------------------------------------------------------------------
+    # Join community
+    # ------------------------------------------------------------------
 
     @staticmethod
     def join_community(
@@ -89,6 +128,38 @@ class XPoster:
     ) -> dict[str, Any]:
         """Join an X community via GraphQL JoinCommunity mutation."""
         url = "https://x.com/i/api/graphql/b9bfcMQtJqWWCoyuM91Cpw/JoinCommunity"
+        headers = {
+            "Accept": "*/*",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Language": "en-US,en;q=0.9",
+            "authorization": _BEARER,
+            "Connection": "keep-alive",
+            "Content-Type": "application/json",
+            "Cookie": f"ct0={ct0};auth_token={auth_token}",
+            "Host": "x.com",
+            "Origin": "https://x.com",
+            "Referer": f"https://x.com/i/communities/{community_id}",
+            "sec-ch-ua": '"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+            "x-client-transaction-id": "",
+            "x-csrf-token": ct0,
+            "x-twitter-active-user": "yes",
+            "x-twitter-auth-type": "OAuth2Session",
+            "x-twitter-client-language": "en",
+        }
+        try:
+            headers["x-client-transaction-id"] = xtid.generate_transaction_id(
+                method="POST",
+                path="/i/api/graphql/b9bfcMQtJqWWCoyuM91Cpw/JoinCommunity",
+            )
+        except Exception:
+            pass
+
         payload = {
             "variables": {"communityId": community_id},
             "features": {
@@ -101,15 +172,159 @@ class XPoster:
             },
             "queryId": "b9bfcMQtJqWWCoyuM91Cpw",
         }
-        headers = XPoster._common_headers(ct0, auth_token)
-        headers["x-client-transaction-id"] = xtid.generate_transaction_id(
-            method="POST",
-            path="/i/api/graphql/b9bfcMQtJqWWCoyuM91Cpw/JoinCommunity",
-        )
-        resp = session.post(url, headers=headers, json=payload)
+
+        for attempt in range(3):
+            try:
+                resp = session.post(url, headers=headers, json=payload)
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                time.sleep(1)
+
         data = resp.json()
-        logger.info("JoinCommunity response status: %d", resp.status_code)
+        logger.info("JoinCommunity response: status=%d, body=%s", resp.status_code, str(data)[:200])
         return data
+
+    # ------------------------------------------------------------------
+    # Upload media (image)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def upload_media(
+        session: curl_requests.Session,
+        ct0: str,
+        auth_token: str,
+        xtid: Any,
+        image_path: str,
+    ) -> str | None:
+        """Upload an image via upload.x.com (INIT/APPEND/FINALIZE).
+
+        Returns the ``media_id_string``, or ``None`` on failure.
+        Uses the exact headers and call pattern from the working reference.
+        """
+        upload_url = "https://upload.x.com/i/media/upload.json"
+
+        # Media upload uses Chrome/136 sec-ch-ua (matches reference)
+        headers = {
+            "accept": "*/*",
+            "accept-language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "authorization": _BEARER,
+            "priority": "u=1, i",
+            "referer": "https://twitter.com/",
+            "sec-ch-ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+            "sec-ch-ua-arch": '"x86"',
+            "sec-ch-ua-bitness": '"64"',
+            "sec-ch-ua-full-version": '"136.0.7103.93"',
+            "sec-ch-ua-full-version-list": '"Chromium";v="136.0.7103.93", "Google Chrome";v="136.0.7103.93", "Not.A/Brand";v="99.0.0.0"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-model": '""',
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-ch-ua-platform-version": '"19.0.0"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+            "x-client-transaction-id": "",
+            "x-client-uuid": "d1daa70d-1041-4336-a9aa-b94928a73383",
+            "x-csrf-token": ct0,
+            "x-twitter-active-user": "yes",
+            "x-twitter-auth-type": "OAuth2Session",
+            "x-twitter-client-language": "en",
+            "Cookie": f"ct0={ct0};auth_token={auth_token};",
+        }
+        try:
+            headers["x-client-transaction-id"] = xtid.generate_transaction_id(
+                method="POST",
+                path="https://upload.x.com/i/media/upload.json",
+            )
+        except Exception:
+            pass
+
+        media_size = os.path.getsize(image_path)
+
+        # Step 1 — INIT (use data= not params=, matching reference)
+        init_params = {
+            "command": "INIT",
+            "total_bytes": media_size,
+            "media_type": "image/jpeg",
+            "media_category": "tweet_image",
+        }
+        r_init = None
+        for attempt in range(3):
+            try:
+                r_init = session.post(upload_url, headers=headers, data=init_params)
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    logger.error("Media INIT request failed after 3 attempts: %s", exc)
+                    return None
+                time.sleep(1)
+
+        raw_text = r_init.text[:200] if r_init.text else "(empty)"
+        logger.info("Media INIT response: status=%d, body=%s", r_init.status_code, raw_text)
+
+        try:
+            init_data = r_init.json()
+        except Exception as exc:
+            logger.error("Media INIT JSON parse failed: %s, body=%s", exc, raw_text)
+            return None
+
+        # Reference uses media_id_string
+        media_id = init_data.get("media_id_string") or str(init_data.get("media_id", ""))
+        if not media_id:
+            logger.error("Media INIT response missing media_id: %s", raw_text)
+            return None
+        logger.info("Media INIT: media_id=%s", media_id)
+
+        # Step 2 — APPEND (read file into memory, matching reference)
+        with open(image_path, "rb") as f:
+            media_data = f.read()
+
+        append_params = {
+            "command": "APPEND",
+            "media_id": media_id,
+            "segment_index": 0,
+        }
+        mp = CurlMime()
+        mp.addpart(
+            name="media",
+            content_type="image/jpg",
+            filename="image.jpg",
+            data=media_data,
+        )
+        for attempt in range(3):
+            try:
+                session.post(upload_url, headers=headers, data=append_params, multipart=mp)
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    logger.error("Media APPEND failed after 3 attempts: %s", exc)
+                    return None
+                time.sleep(1)
+        logger.info("Media APPEND complete")
+
+        # Step 3 — FINALIZE
+        finalize_params = {
+            "command": "FINALIZE",
+            "media_id": media_id,
+        }
+        for attempt in range(3):
+            try:
+                r_fin = session.post(upload_url, headers=headers, data=finalize_params)
+                logger.info("Media FINALIZE: status=%d", r_fin.status_code)
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    logger.error("Media FINALIZE failed after 3 attempts: %s", exc)
+                    return None
+                time.sleep(1)
+
+        return media_id
+
+    # ------------------------------------------------------------------
+    # Create tweet (inside a community)
+    # ------------------------------------------------------------------
 
     @staticmethod
     def create_tweet(
@@ -121,15 +336,50 @@ class XPoster:
         text: str,
         media_id: str | None = None,
     ) -> dict[str, Any]:
-        """Post a tweet in a community via GraphQL CreateTweet mutation."""
+        """Post a tweet in a community via GraphQL CreateTweet mutation.
+
+        Uses the exact headers and payload from the working reference.
+        CreateTweet headers use Chrome/141 (different from upload's Chrome/136).
+        """
         if not community_id:
             raise ValueError("community_id is required to post inside a community")
 
         url = "https://x.com/i/api/graphql/D9qc0aITr1vnjAzG_Il-6Q/CreateTweet"
-        media_entities = []
-        if media_id:
-            media_entities.append({"media_id": media_id, "tagged_users": []})
 
+        # CreateTweet-specific headers (Chrome v141, matching reference)
+        headers = {
+            "Accept": "*/*",
+            "Accept-Encoding": "utf-8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Authorization": _BEARER,
+            "Cookie": f"ct0={ct0};auth_token={auth_token}",
+            "Origin": "https://x.com",
+            "Referer": "https://x.com/",
+            "sec-ch-ua": '"Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+            "x-client-transaction-id": xtid.generate_transaction_id(
+                method="POST",
+                path="/i/api/graphql/D9qc0aITr1vnjAzG_Il-6Q/CreateTweet",
+            ),
+            "x-csrf-token": ct0,
+            "x-twitter-active-user": "yes",
+            "x-twitter-auth-type": "OAuth2Session",
+            "x-twitter-client-language": "en",
+        }
+
+        # Build media_entities
+        if media_id:
+            media_entities = [{"media_id": media_id, "tagged_users": []}]
+        else:
+            media_entities = []
+
+        # Full features dict from the working reference (includes additional
+        # keys like articles_preview_enabled, grok_* that were previously missing)
         payload = {
             "variables": {
                 "tweet_text": text,
@@ -157,105 +407,38 @@ class XPoster:
                 "responsive_web_profile_redirect_enabled": False,
                 "rweb_tipjar_consumption_enabled": True,
                 "verified_phone_label_enabled": False,
+                "articles_preview_enabled": True,
+                "responsive_web_grok_community_note_auto_translation_is_enabled": False,
                 "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
                 "freedom_of_speech_not_reach_fetch_enabled": True,
                 "standardized_nudges_misinfo": True,
                 "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+                "responsive_web_grok_image_annotation_enabled": True,
+                "responsive_web_grok_imagine_annotation_enabled": True,
                 "responsive_web_graphql_timeline_navigation_enabled": True,
                 "responsive_web_enhance_cards_enabled": False,
             },
             "queryId": "D9qc0aITr1vnjAzG_Il-6Q",
         }
-        headers = XPoster._common_headers(ct0, auth_token)
-        headers["x-client-transaction-id"] = xtid.generate_transaction_id(
-            method="POST",
-            path="/i/api/graphql/D9qc0aITr1vnjAzG_Il-6Q/CreateTweet",
-        )
+
         logger.info(
             "CreateTweet FULL PAYLOAD:\n%s",
             json.dumps(payload, indent=2, ensure_ascii=False),
         )
-        resp = session.post(url, headers=headers, json=payload)
-        data = resp.json()
-        logger.info("CreateTweet response: status=%d, body=%s", resp.status_code, json.dumps(data, ensure_ascii=False)[:500])
+
+        for attempt in range(3):
+            try:
+                resp = session.post(url, headers=headers, json=payload)
+                data = resp.json()
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    raise
+                time.sleep(1)
+
+        logger.info(
+            "CreateTweet response: status=%d, body=%s",
+            resp.status_code,
+            json.dumps(data, ensure_ascii=False)[:500],
+        )
         return data
-
-    @staticmethod
-    def upload_media(
-        session: curl_requests.Session,
-        ct0: str,
-        auth_token: str,
-        xtid: Any,
-        image_path: str,
-    ) -> str | None:
-        """Upload an image via upload.x.com (INIT/APPEND/FINALIZE).
-
-        Returns the ``media_id`` string, or ``None`` on failure.
-        """
-        import os
-
-        upload_url = "https://upload.x.com/i/media/upload.json"
-        headers = XPoster._common_headers(ct0, auth_token)
-        # Remove Content-Type for multipart steps
-        headers_no_ct = {k: v for k, v in headers.items() if k != "Content-Type"}
-
-        file_size = os.path.getsize(image_path)
-
-        # Step 1 — INIT
-        init_params = {
-            "command": "INIT",
-            "total_bytes": str(file_size),
-            "media_type": "image/jpeg",
-            "media_category": "tweet_image",
-        }
-        resp = session.post(upload_url, headers=headers_no_ct, params=init_params)
-
-        # Log raw response before attempting JSON parse
-        raw_text = resp.text[:200] if resp.text else "(empty)"
-        logger.info("Media INIT response: status=%d, body=%s", resp.status_code, raw_text)
-
-        if resp.status_code != 200:
-            logger.error("Media INIT failed: status=%d, body=%s", resp.status_code, raw_text)
-            return None
-
-        try:
-            init_data = resp.json()
-        except Exception as exc:
-            logger.error("Media INIT JSON parse failed: %s, body=%s", exc, raw_text)
-            return None
-
-        media_id = str(init_data.get("media_id", ""))
-        if not media_id:
-            logger.error("Media INIT response missing media_id: %s", raw_text)
-            return None
-        logger.info("Media INIT: media_id=%s", media_id)
-
-        # Step 2 — APPEND
-        mime = CurlMime()
-        mime.addpart(
-            name="media",
-            filename=os.path.basename(image_path),
-            content_type="application/octet-stream",
-            local_path=image_path,
-        )
-        append_params = {
-            "command": "APPEND",
-            "media_id": media_id,
-            "segment_index": "0",
-        }
-        session.post(
-            upload_url,
-            headers=headers_no_ct,
-            params=append_params,
-            multipart=mime,
-        )
-        logger.info("Media APPEND complete")
-
-        # Step 3 — FINALIZE
-        finalize_params = {
-            "command": "FINALIZE",
-            "media_id": media_id,
-        }
-        resp = session.post(upload_url, headers=headers_no_ct, params=finalize_params)
-        logger.info("Media FINALIZE: status=%d", resp.status_code)
-        return media_id
