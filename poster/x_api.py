@@ -122,6 +122,9 @@ class XPoster:
         media_id: str | None = None,
     ) -> dict[str, Any]:
         """Post a tweet in a community via GraphQL CreateTweet mutation."""
+        if not community_id:
+            raise ValueError("community_id is required to post inside a community")
+
         url = "https://x.com/i/api/graphql/D9qc0aITr1vnjAzG_Il-6Q/CreateTweet"
         media_entities = []
         if media_id:
@@ -130,7 +133,7 @@ class XPoster:
         payload = {
             "variables": {
                 "tweet_text": text,
-                "community_id": community_id,
+                "community_id": str(community_id),
                 "dark_request": False,
                 "media": {
                     "media_entities": media_entities,
@@ -168,9 +171,13 @@ class XPoster:
             method="POST",
             path="/i/api/graphql/D9qc0aITr1vnjAzG_Il-6Q/CreateTweet",
         )
+        logger.info(
+            "CreateTweet: community_id=%s, media_id=%s, text=%s",
+            community_id, media_id, text[:80],
+        )
         resp = session.post(url, headers=headers, json=payload)
         data = resp.json()
-        logger.info("CreateTweet response status: %d", resp.status_code)
+        logger.info("CreateTweet response: status=%d, body=%s", resp.status_code, str(data)[:300])
         return data
 
     @staticmethod

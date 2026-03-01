@@ -82,6 +82,14 @@ _BASE_TIMEOUT = 15 * 60
 _TIMEOUT_STEP = 5 * 60
 _MAX_TIMEOUT = 30 * 60
 
+
+def _extract_symbol(token_name: str) -> str:
+    """Extract ticker like '$JOBLESS' from 'Jobless Coin ($JOBLESS)'. Falls back to raw name."""
+    m = re.search(r'\(\$([^)]+)\)', token_name)
+    if m:
+        return f"${m.group(1)}"
+    return token_name
+
 # ---------------------------------------------------------------------------
 # Alerter callbacks
 # ---------------------------------------------------------------------------
@@ -353,9 +361,8 @@ async def scraper_loop(db: Database, bot: TelegramBot, pool: TokenPool) -> None:
             # --- Handle community_deleted: skip gracefully ---
             if error == "community_deleted":
                 db.mark_task_failed(task_id, "community_deleted")
-                await bot.broadcast(
-                    f"{token_name} -- community was deleted/unavailable. Skipped."
-                )
+                symbol = _extract_symbol(token_name)
+                await bot.broadcast(f"🗑 {symbol}: community deleted")
                 logger.info("Task #%d: community deleted, skipped", task_id)
                 # Do NOT escalate timeout for deleted communities
                 continue
@@ -367,9 +374,8 @@ async def scraper_loop(db: Database, bot: TelegramBot, pool: TokenPool) -> None:
 
             if error:
                 db.mark_task_failed(task_id, error)
-                await bot.broadcast(
-                    f"Scrape failed for {token_name}:\n{error}"
-                )
+                symbol = _extract_symbol(token_name)
+                await bot.broadcast(f"❌ {symbol}: {error}")
                 logger.error("Task #%d failed: %s", task_id, error)
                 await asyncio.sleep(120)
                 continue
@@ -378,10 +384,8 @@ async def scraper_loop(db: Database, bot: TelegramBot, pool: TokenPool) -> None:
             current_timeout = _BASE_TIMEOUT  # reset on success
             saved = db.save_usernames(task_id, community_id, usernames)
             db.mark_task_completed(task_id, len(usernames))
-            await bot.broadcast(
-                f"Scraped {token_name}: "
-                f"{len(usernames)} usernames ({saved} new)"
-            )
+            symbol = _extract_symbol(token_name)
+            await bot.broadcast(f"✅ Scraped {symbol}: {saved} new usernames")
             logger.info(
                 "Task #%d completed: %d usernames (%d new)",
                 task_id, len(usernames), saved,
