@@ -25,11 +25,7 @@ from alerter.filters import TokenFilter
 from alerter.monitor import DexScreenerMonitor, TokenMemory, extract_community_id
 from bot.telegram_bot import TelegramBot
 from database.db import Database
-
-
-def _escape_md(text: str) -> str:
-    """Escape Markdown special characters for Telegram parse_mode=Markdown."""
-    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!\\])', r'\\\1', text)
+from token_pool import TokenPool
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -69,32 +65,22 @@ def setup_logging() -> logging.Logger:
 logger = setup_logging()
 
 # ---------------------------------------------------------------------------
-# Shared mutable auth token (updated at runtime via /token command)
+# Shared state
 # ---------------------------------------------------------------------------
 
-_auth_token_lock = asyncio.Lock()
-_current_auth_token: str = cfg.X_AUTH_TOKEN
+_bot: TelegramBot | None = None
+_db: Database | None = None
+_pool: TokenPool | None = None
+_all_tokens_dead = False  # when True, scraper_loop sleeps until new token
 
-
-async def get_auth_token() -> str:
-    async with _auth_token_lock:
-        return _current_auth_token
-
-
-async def set_auth_token(new_token: str) -> None:
-    global _current_auth_token
-    async with _auth_token_lock:
-        _current_auth_token = new_token
-    logger.info("X auth_token updated at runtime")
-
+# Adaptive timeout: starts at 15 min, grows +5 on timeout, max 30, resets on success
+_BASE_TIMEOUT = 15 * 60
+_TIMEOUT_STEP = 5 * 60
+_MAX_TIMEOUT = 30 * 60
 
 # ---------------------------------------------------------------------------
 # Alerter callbacks
 # ---------------------------------------------------------------------------
-
-# These will be connected after all components are initialized
-_bot: TelegramBot | None = None
-_db: Database | None = None
 
 
 async def on_alert(text: str) -> None:
@@ -131,17 +117,17 @@ async def on_new_task(
 # Scraper loop
 # ---------------------------------------------------------------------------
 
-_auth_invalid = False  # flag to stop scraping when token is bad
 
-
-async def scraper_loop(db: Database, bot: TelegramBot) -> None:
+async def scraper_loop(db: Database, bot: TelegramBot, pool: TokenPool) -> None:
     """Continuously process pending scrape tasks, one at a time."""
-    global _auth_invalid
-    logger.info("Scraper loop started (check every 60s)")
+    global _all_tokens_dead
+    current_timeout = _BASE_TIMEOUT
+    logger.info("Scraper loop started (check every 60s, base timeout %ds)", _BASE_TIMEOUT)
 
     while True:
         try:
-            if _auth_invalid:
+            # --- Paused: all tokens exhausted ---
+            if _all_tokens_dead:
                 await asyncio.sleep(30)
                 continue
 
@@ -155,19 +141,23 @@ async def scraper_loop(db: Database, bot: TelegramBot) -> None:
             community_id: str = task["community_id"]
             token_name = task.get("token_name") or community_id
 
-            db.mark_task_in_progress(task_id)
-            logger.info("Starting scrape task #%d: %s", task_id, community_url)
-
-            auth_token = await get_auth_token()
+            # Get current valid token from pool
+            auth_token = pool.get_current()
             if not auth_token:
-                msg = "X auth_token is empty. Send a new one via /token"
-                await bot.broadcast(f"⚠️ {msg}")
-                db.mark_task_failed(task_id, msg)
-                await asyncio.sleep(60)
+                logger.error("No valid auth tokens available")
+                db.mark_task_failed(task_id, "no valid auth tokens")
+                await _alert_all_tokens_dead(bot, pool)
                 continue
 
-            # Run Playwright in a killable subprocess
+            db.mark_task_in_progress(task_id)
+            logger.info(
+                "Starting task #%d: %s (timeout=%ds, token=%s)",
+                task_id, community_url, current_timeout, pool.current_label(),
+            )
+
+            # --- Run Playwright in a killable subprocess ---
             result_file = cfg.DATA_DIR / f"task_result_{task_id}.json"
+            timed_out = False
             try:
                 proc = await asyncio.create_subprocess_exec(
                     sys.executable, "-m", "scraper.runner",
@@ -178,16 +168,18 @@ async def scraper_loop(db: Database, bot: TelegramBot) -> None:
                 )
                 try:
                     stdout, stderr = await asyncio.wait_for(
-                        proc.communicate(), timeout=35 * 60,
+                        proc.communicate(), timeout=current_timeout,
                     )
                 except asyncio.TimeoutError:
                     proc.kill()
                     await proc.wait()
+                    timed_out = True
                     logger.error(
-                        "Task #%d KILLED after 35-min timeout (pid %d)",
-                        task_id, proc.pid,
+                        "Task #%d KILLED after %d-min timeout (pid %d)",
+                        task_id, current_timeout // 60, proc.pid,
                     )
-                    usernames, error = [], "subprocess timeout (35 min) — process killed"
+                    usernames: list[str] = []
+                    error: str | None = f"subprocess timeout ({current_timeout // 60} min) — process killed"
                 else:
                     # Log subprocess output
                     if stdout:
@@ -209,48 +201,61 @@ async def scraper_loop(db: Database, bot: TelegramBot) -> None:
             except Exception as exc:
                 usernames, error = [], str(exc)
             finally:
-                # Clean up result file
                 try:
                     result_file.unlink(missing_ok=True)
                 except Exception:
                     pass
 
+            # --- Handle auth_token_invalid: rotate, don't fail task ---
             if error == "auth_token_invalid":
-                _auth_invalid = True
-                db.mark_task_failed(task_id, error)
-                paused = db.pause_all_pending()
-                await bot.broadcast(
-                    "⚠️ X auth\\_token is invalid! "
-                    f"{paused} pending task(s) paused.\n"
-                    "Send a new token via /token"
-                )
-                logger.error("Auth token invalid — scraper paused")
-                continue
+                old_label = pool.current_label()
+                new_token = pool.rotate_next()
+                if new_token:
+                    valid_left = pool.count_valid()
+                    await bot.broadcast(
+                        f"⚠️ Token {old_label} expired. "
+                        f"Switching to {pool.current_label()}. "
+                        f"Valid tokens left: {valid_left}"
+                    )
+                    logger.warning(
+                        "Token %s invalid, rotated to %s (%d valid left)",
+                        old_label, pool.current_label(), valid_left,
+                    )
+                    # Return task to pending for retry with new token
+                    db.mark_task_failed(task_id, "auth_token_invalid (rotated)")
+                    db.retry_task(task_id)
+                    continue
+                else:
+                    # All tokens dead
+                    db.mark_task_failed(task_id, error)
+                    await _alert_all_tokens_dead(bot, pool)
+                    continue
+
+            # --- Adaptive timeout ---
+            if timed_out:
+                current_timeout = min(current_timeout + _TIMEOUT_STEP, _MAX_TIMEOUT)
+                logger.info("Timeout escalated to %d min", current_timeout // 60)
 
             if error:
                 db.mark_task_failed(task_id, error)
-                safe_name = _escape_md(token_name)
                 await bot.broadcast(
-                    f"❌ Scrape failed for *{safe_name}*:\n`{error}`"
+                    f"❌ Scrape failed for {token_name}:\n{error}"
                 )
                 logger.error("Task #%d failed: %s", task_id, error)
-                # Cool down before next task
                 await asyncio.sleep(120)
                 continue
 
-            # Success — save usernames
+            # --- Success ---
+            current_timeout = _BASE_TIMEOUT  # reset on success
             saved = db.save_usernames(task_id, community_id, usernames)
             db.mark_task_completed(task_id, len(usernames))
-            safe_name = _escape_md(token_name)
             await bot.broadcast(
-                f"✅ Scraped *{safe_name}*: "
+                f"✅ Scraped {token_name}: "
                 f"{len(usernames)} usernames ({saved} new)"
             )
             logger.info(
                 "Task #%d completed: %d usernames (%d new)",
-                task_id,
-                len(usernames),
-                saved,
+                task_id, len(usernames), saved,
             )
 
         except asyncio.CancelledError:
@@ -258,6 +263,21 @@ async def scraper_loop(db: Database, bot: TelegramBot) -> None:
         except Exception as exc:
             logger.error("Scraper loop error: %s", exc, exc_info=True)
             await asyncio.sleep(60)
+
+
+async def _alert_all_tokens_dead(bot: TelegramBot, pool: TokenPool) -> None:
+    """Send 3 repeated alerts and pause scraper."""
+    global _all_tokens_dead
+    _all_tokens_dead = True
+    msg = (
+        "🚨🚨🚨 ALL TOKENS EXPIRED! Scraper STOPPED.\n"
+        "Send new tokens via /token 🚨🚨🚨"
+    )
+    for i in range(3):
+        await bot.broadcast(msg)
+        if i < 2:
+            await asyncio.sleep(60)
+    logger.error("All auth tokens exhausted — scraper paused")
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +291,6 @@ async def on_add_community(url: str) -> None:
         return
     cid = extract_community_id(url)
     if not cid:
-        # Try to extract from the raw URL
         m = re.search(r"communities/(\d+)", url)
         cid = m.group(1) if m else "unknown"
 
@@ -282,16 +301,29 @@ async def on_add_community(url: str) -> None:
     _db.create_task(
         community_url=members_url,
         community_id=cid,
-        delay_minutes=0,  # immediate
+        delay_minutes=0,
     )
 
 
 async def on_update_token(new_token: str) -> None:
-    """Handle /token command — update runtime token, resume scraper."""
-    global _auth_invalid
-    await set_auth_token(new_token)
-    _auth_invalid = False
-    logger.info("Auth token updated, scraper resumed")
+    """Handle /token command — add token to pool, resume scraper."""
+    global _all_tokens_dead
+    if _pool:
+        _pool.add(new_token)
+    _all_tokens_dead = False
+    logger.info("Token added to pool, scraper resumed")
+
+
+async def on_update_tokens_bulk(values: list[str]) -> tuple[int, int]:
+    """Handle bulk token upload — returns (new, dups)."""
+    global _all_tokens_dead
+    if _pool:
+        new, dups = _pool.add_many(values)
+        if new:
+            _all_tokens_dead = False
+            logger.info("Bulk token upload: %d new, %d dups", new, dups)
+        return new, dups
+    return 0, 0
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +331,7 @@ async def on_update_token(new_token: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global _bot, _db
+    global _bot, _db, _pool
 
     logger.info("=" * 60)
     logger.info("DexScreener + X Scraper Service starting")
@@ -309,15 +341,19 @@ async def main() -> None:
     db = Database()
     _db = db
 
+    pool = TokenPool()
+    _pool = pool
+
     token_filter = TokenFilter()
     memory = TokenMemory()
 
     bot = TelegramBot(
         db=db,
         token_filter=token_filter,
-        on_retry_task=None,
+        token_pool=pool,
         on_add_community=on_add_community,
         on_update_token=on_update_token,
+        on_update_tokens_bulk=on_update_tokens_bulk,
     )
     _bot = bot
 
@@ -328,17 +364,24 @@ async def main() -> None:
         on_new_task=on_new_task,
     )
 
-    # Send startup notification
+    # Startup notification
+    token_info = pool.summary()
     await bot.broadcast(
-        "🚀 *Service started!*\n\n"
+        f"🚀 Service started!\n\n"
         f"Filters:\n{token_filter.summary()}\n\n"
-        "Send /help for commands."
+        f"{token_info}\n\n"
+        f"Send /help for commands."
     )
+
+    if not pool.has_valid():
+        await bot.broadcast(
+            "⚠️ No valid auth tokens! Send tokens via /token"
+        )
 
     # Run all loops concurrently
     await asyncio.gather(
         monitor.run(),
-        scraper_loop(db, bot),
+        scraper_loop(db, bot, pool),
         bot.run(),
     )
 

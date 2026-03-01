@@ -16,13 +16,9 @@ import aiohttp
 from alerter.filters import TokenFilter
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_USER_IDS
 from database.db import Database
+from token_pool import TokenPool
 
 logger = logging.getLogger(__name__)
-
-
-def _escape_md(text: str) -> str:
-    """Escape Markdown special characters for Telegram parse_mode=Markdown."""
-    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!\\])', r'\\\1', text)
 
 
 class TelegramBot:
@@ -32,15 +28,17 @@ class TelegramBot:
         self,
         db: Database,
         token_filter: TokenFilter | None = None,
-        on_retry_task: Callable[[int], Coroutine[Any, Any, None]] | None = None,
+        token_pool: TokenPool | None = None,
         on_add_community: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         on_update_token: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        on_update_tokens_bulk: Callable[[list[str]], Coroutine[Any, Any, tuple[int, int]]] | None = None,
     ) -> None:
         self.db = db
         self._filter = token_filter
-        self._on_retry = on_retry_task
+        self._pool = token_pool
         self._on_add = on_add_community
         self._on_update_token = on_update_token
+        self._on_update_tokens_bulk = on_update_tokens_bulk
         self._last_update_id = 0
         self._start_time = datetime.now(timezone.utc)
         self._buffer: deque[str] = deque(maxlen=200)
@@ -64,7 +62,7 @@ class TelegramBot:
                 ok = await self._send(uid, text, session)
                 if not ok:
                     self._buffer.append(text)
-                    return  # will retry later
+                    return
 
     async def _flush_buffer(self, session: aiohttp.ClientSession) -> None:
         while self._buffer:
@@ -72,14 +70,14 @@ class TelegramBot:
             for uid in TELEGRAM_USER_IDS:
                 ok = await self._send(uid, msg, session)
                 if not ok:
-                    return  # stop flushing, will retry next cycle
+                    return
             self._buffer.popleft()
 
     async def _send(
         self, chat_id: str, text: str, session: aiohttp.ClientSession
     ) -> bool:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
+        payload: dict[str, Any] = {
             "chat_id": chat_id,
             "text": text,
             "parse_mode": "Markdown",
@@ -101,6 +99,27 @@ class TelegramBot:
                         logger.error("Telegram send (plain) %s (%d): %s", chat_id, resp2.status, err2)
                         return False
                 logger.error("Telegram send %s (%d): %s", chat_id, resp.status, err)
+                return False
+        except Exception as exc:
+            logger.error("Telegram send %s failed: %s", chat_id, exc)
+            return False
+
+    async def _send_plain(
+        self, chat_id: str, text: str, session: aiohttp.ClientSession
+    ) -> bool:
+        """Send a message as plain text (no parse_mode)."""
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        try:
+            async with session.post(url, json=payload) as resp:
+                if resp.status == 200:
+                    return True
+                err = await resp.text()
+                logger.error("Telegram send (plain) %s (%d): %s", chat_id, resp.status, err)
                 return False
         except Exception as exc:
             logger.error("Telegram send %s failed: %s", chat_id, exc)
@@ -137,6 +156,32 @@ class TelegramBot:
             return False
 
     # ------------------------------------------------------------------
+    # File download helper
+    # ------------------------------------------------------------------
+
+    async def _download_file(
+        self, file_id: str, session: aiohttp.ClientSession
+    ) -> str | None:
+        """Download a Telegram file by file_id, return its text content."""
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile"
+            async with session.get(url, params={"file_id": file_id}) as resp:
+                if resp.status != 200:
+                    return None
+                info = await resp.json()
+            file_path = info.get("result", {}).get("file_path")
+            if not file_path:
+                return None
+            dl_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+            async with session.get(dl_url) as resp:
+                if resp.status != 200:
+                    return None
+                return (await resp.read()).decode("utf-8", errors="replace")
+        except Exception as exc:
+            logger.error("File download failed: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------
     # Command handling
     # ------------------------------------------------------------------
 
@@ -166,30 +211,36 @@ class TelegramBot:
             await self._cmd_add(chat_id, arg, session)
         elif cmd == "/token":
             await self._cmd_token(chat_id, arg, session)
+        elif cmd == "/tokens":
+            await self._cmd_tokens(chat_id, session)
+        elif cmd == "/deltoken":
+            await self._cmd_deltoken(chat_id, arg, session)
         elif cmd == "/filters":
             await self._cmd_filters(chat_id, arg, session)
         else:
-            await self._send(chat_id, "Unknown command. Send /help", session)
+            await self._send_plain(chat_id, "Unknown command. Send /help", session)
 
     # --- /help ---
 
     async def _cmd_help(self, cid: str, s: aiohttp.ClientSession) -> None:
         msg = (
-            "*DexScreener + X Scraper Service*\n\n"
-            "/status — stats overview\n"
-            "/tasks — last 10 scrape tasks\n"
-            "/export `<community_id>` — export usernames\n"
-            "/export\\_all — export ALL usernames\n"
-            "/retry `<task_id>` — re-run a failed task\n"
-            "/add `<community_url>` — manually add a community\n"
-            "/token `<auth_token>` — update X auth token at runtime\n"
-            "/filters — show/change filters\n"
-            "  /filters mcap `<min>` `<max>`\n"
-            "  /filters liquidity `<min>`\n"
-            "  /filters chains `<c1,c2>`\n"
-            "  /filters age `<min_min>` `<max_h>`"
+            "DexScreener + X Scraper Service\n\n"
+            "/status -- stats overview\n"
+            "/tasks -- last 10 scrape tasks\n"
+            "/export <community_id> -- export usernames\n"
+            "/export_all -- export ALL usernames\n"
+            "/retry <task_id> -- re-run a failed task\n"
+            "/add <community_url> -- manually add a community\n"
+            "/token <auth_token> -- add X auth token (or send .txt file)\n"
+            "/tokens -- list all tokens\n"
+            "/deltoken <num> -- delete token by number\n"
+            "/filters -- show/change filters\n"
+            "  /filters mcap <min> <max>\n"
+            "  /filters liquidity <min>\n"
+            "  /filters chains <c1,c2>\n"
+            "  /filters age <min_min> <max_h>"
         )
-        await self._send(cid, msg, s)
+        await self._send_plain(cid, msg, s)
 
     # --- /status ---
 
@@ -198,25 +249,27 @@ class TelegramBot:
         uptime = datetime.now(timezone.utc) - self._start_time
         h = int(uptime.total_seconds() // 3600)
         m = int((uptime.total_seconds() % 3600) // 60)
+        token_info = self._pool.summary() if self._pool else "N/A"
         msg = (
-            "*Service status*\n\n"
-            f"Uptime: `{h}h {m}m`\n"
-            f"Pending tasks: `{stats['pending']}`\n"
-            f"In progress: `{stats['in_progress']}`\n"
-            f"Completed: `{stats['completed']}`\n"
-            f"Failed: `{stats['failed']}`\n"
-            f"Total unique usernames: `{stats['total_usernames']}`"
+            f"Service status\n\n"
+            f"Uptime: {h}h {m}m\n"
+            f"Pending tasks: {stats['pending']}\n"
+            f"In progress: {stats['in_progress']}\n"
+            f"Completed: {stats['completed']}\n"
+            f"Failed: {stats['failed']}\n"
+            f"Total unique usernames: {stats['total_usernames']}\n\n"
+            f"{token_info}"
         )
-        await self._send(cid, msg, s)
+        await self._send_plain(cid, msg, s)
 
     # --- /tasks ---
 
     async def _cmd_tasks(self, cid: str, s: aiohttp.ClientSession) -> None:
         tasks = self.db.get_recent_tasks(10)
         if not tasks:
-            await self._send(cid, "No tasks yet.", s)
+            await self._send_plain(cid, "No tasks yet.", s)
             return
-        lines = ["*Last 10 tasks:*\n"]
+        lines = ["Last 10 tasks:\n"]
         for t in tasks:
             status_icon = {
                 "pending": "⏳",
@@ -224,12 +277,12 @@ class TelegramBot:
                 "completed": "✅",
                 "failed": "❌",
             }.get(t["status"], "❓")
-            name = _escape_md(t.get("token_name") or t["community_id"])
+            name = t.get("token_name") or t["community_id"]
             lines.append(
                 f"{status_icon} #{t['id']} | {name} | "
                 f"{t['status']} | {t.get('usernames_count', 0)} users"
             )
-        await self._send(cid, "\n".join(lines), s)
+        await self._send_plain(cid, "\n".join(lines), s)
 
     # --- /export <community_id> ---
 
@@ -237,11 +290,11 @@ class TelegramBot:
         self, cid: str, arg: str, s: aiohttp.ClientSession
     ) -> None:
         if not arg:
-            await self._send(cid, "Usage: /export `<community_id>`", s)
+            await self._send_plain(cid, "Usage: /export <community_id>", s)
             return
         usernames = self.db.get_usernames_by_community(arg)
         if not usernames:
-            await self._send(cid, f"No usernames found for community `{arg}`.", s)
+            await self._send_plain(cid, f"No usernames found for community {arg}.", s)
             return
         content = "\n".join(usernames)
         await self._send_document(
@@ -257,7 +310,7 @@ class TelegramBot:
     async def _cmd_export_all(self, cid: str, s: aiohttp.ClientSession) -> None:
         usernames = self.db.get_all_unique_usernames()
         if not usernames:
-            await self._send(cid, "No usernames in database.", s)
+            await self._send_plain(cid, "No usernames in database.", s)
             return
         content = "\n".join(usernames)
         await self._send_document(
@@ -274,17 +327,15 @@ class TelegramBot:
         self, cid: str, arg: str, s: aiohttp.ClientSession
     ) -> None:
         if not arg.isdigit():
-            await self._send(cid, "Usage: /retry `<task_id>`", s)
+            await self._send_plain(cid, "Usage: /retry <task_id>", s)
             return
         task_id = int(arg)
         ok = self.db.retry_task(task_id)
         if ok:
-            await self._send(cid, f"Task #{task_id} re-queued.", s)
+            await self._send_plain(cid, f"Task #{task_id} re-queued.", s)
         else:
-            await self._send(
-                cid,
-                f"Task #{task_id} not found or not in failed state.",
-                s,
+            await self._send_plain(
+                cid, f"Task #{task_id} not found or not in failed state.", s
             )
 
     # --- /add <community_url> ---
@@ -293,9 +344,9 @@ class TelegramBot:
         self, cid: str, arg: str, s: aiohttp.ClientSession
     ) -> None:
         if not arg or "communities" not in arg:
-            await self._send(
+            await self._send_plain(
                 cid,
-                "Usage: /add `<community_url>`\n"
+                "Usage: /add <community_url>\n"
                 "Example: /add https://x.com/i/communities/123456",
                 s,
             )
@@ -303,50 +354,57 @@ class TelegramBot:
 
         if self._on_add:
             await self._on_add(arg)
-            await self._send(cid, f"Community added to queue (no delay): `{arg}`", s)
+            await self._send_plain(cid, f"Community added to queue (no delay): {arg}", s)
         else:
-            await self._send(cid, "Add handler not configured.", s)
+            await self._send_plain(cid, "Add handler not configured.", s)
 
-    # --- /token <new_auth_token> ---
+    # --- /token <value> ---
 
     async def _cmd_token(
         self, cid: str, arg: str, s: aiohttp.ClientSession
     ) -> None:
         if not arg:
-            await self._send(cid, "Usage: /token `<new_auth_token>`", s)
+            await self._send_plain(cid, "Usage: /token <auth_token>\nOr send a .txt file with tokens.", s)
             return
 
-        # Update .env file
-        try:
-            env_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"
-            )
-            lines: list[str] = []
-            found = False
-            if os.path.exists(env_path):
-                with open(env_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        if line.startswith("X_AUTH_TOKEN="):
-                            lines.append(f"X_AUTH_TOKEN={arg}\n")
-                            found = True
-                        else:
-                            lines.append(line)
-            if not found:
-                lines.append(f"X_AUTH_TOKEN={arg}\n")
-            with open(env_path, "w", encoding="utf-8") as f:
-                f.writelines(lines)
-        except Exception as exc:
-            logger.error("Failed to write .env: %s", exc)
-
-        # Notify callback to update runtime value
+        # Single token
         if self._on_update_token:
             await self._on_update_token(arg)
 
         # Resume paused tasks
         resumed = self.db.resume_paused_tasks()
 
-        reply = f"auth\\_token updated.  {resumed} paused task(s) re-queued."
-        await self._send(cid, reply, s)
+        if self._pool:
+            valid = self._pool.count_valid()
+            await self._send_plain(
+                cid,
+                f"Token added. {resumed} paused task(s) re-queued. Valid tokens: {valid}",
+                s,
+            )
+        else:
+            await self._send_plain(cid, f"Token updated. {resumed} paused task(s) re-queued.", s)
+
+    # --- /tokens ---
+
+    async def _cmd_tokens(self, cid: str, s: aiohttp.ClientSession) -> None:
+        if not self._pool:
+            await self._send_plain(cid, "Token pool not configured.", s)
+            return
+        await self._send_plain(cid, self._pool.summary(), s)
+
+    # --- /deltoken <num> ---
+
+    async def _cmd_deltoken(
+        self, cid: str, arg: str, s: aiohttp.ClientSession
+    ) -> None:
+        if not arg.isdigit():
+            await self._send_plain(cid, "Usage: /deltoken <number>", s)
+            return
+        idx = int(arg)
+        if self._pool and self._pool.delete(idx):
+            await self._send_plain(cid, f"Token #{idx} deleted.", s)
+        else:
+            await self._send_plain(cid, f"Token #{idx} not found.", s)
 
     # --- /filters ---
 
@@ -354,12 +412,11 @@ class TelegramBot:
         self, cid: str, arg: str, s: aiohttp.ClientSession
     ) -> None:
         if self._filter is None:
-            await self._send(cid, "Filters not configured.", s)
+            await self._send_plain(cid, "Filters not configured.", s)
             return
 
-        # No args — show current filters
         if not arg:
-            await self._send(cid, f"*Current filters:*\n{self._filter.summary()}", s)
+            await self._send_plain(cid, f"Current filters:\n{self._filter.summary()}", s)
             return
 
         parts = arg.split()
@@ -377,24 +434,71 @@ class TelegramBot:
             elif subcmd == "age" and len(parts) == 3:
                 self._filter.update_age(int(parts[1]), int(parts[2]))
             else:
-                await self._send(
+                await self._send_plain(
                     cid,
                     "Usage:\n"
-                    "/filters — show current\n"
-                    "/filters mcap `<min>` `<max>`\n"
-                    "/filters liquidity `<min>`\n"
-                    "/filters chains `<c1,c2>`\n"
-                    "/filters age `<min_minutes>` `<max_hours>`",
+                    "/filters -- show current\n"
+                    "/filters mcap <min> <max>\n"
+                    "/filters liquidity <min>\n"
+                    "/filters chains <c1,c2>\n"
+                    "/filters age <min_minutes> <max_hours>",
                     s,
                 )
                 return
         except (ValueError, IndexError):
-            await self._send(cid, "Invalid values. Check numbers and try again.", s)
+            await self._send_plain(cid, "Invalid values. Check numbers and try again.", s)
             return
 
-        await self._send(
-            cid, f"Filters updated:\n{self._filter.summary()}", s
+        await self._send_plain(cid, f"Filters updated:\n{self._filter.summary()}", s)
+
+    # ------------------------------------------------------------------
+    # Document (file upload) handling
+    # ------------------------------------------------------------------
+
+    async def _handle_document(
+        self, msg: dict, chat_id: str, session: aiohttp.ClientSession
+    ) -> None:
+        """Handle uploaded .txt files as potential token lists."""
+        doc = msg.get("document", {})
+        file_name = doc.get("file_name", "")
+        file_id = doc.get("file_id")
+        caption = (msg.get("caption") or "").strip().lower()
+
+        if not file_id:
+            return
+
+        # Accept if: caption is /token, or filename contains "token", or it's a .txt file
+        is_token_file = (
+            caption.startswith("/token")
+            or "token" in file_name.lower()
+            or file_name.lower().endswith(".txt")
         )
+        if not is_token_file:
+            return
+
+        content = await self._download_file(file_id, session)
+        if content is None:
+            await self._send_plain(chat_id, "Failed to download file.", session)
+            return
+
+        values = [line.strip() for line in content.splitlines() if line.strip()]
+        if not values:
+            await self._send_plain(chat_id, "File is empty.", session)
+            return
+
+        if self._on_update_tokens_bulk:
+            new, dups = await self._on_update_tokens_bulk(values)
+            resumed = self.db.resume_paused_tasks()
+            valid = self._pool.count_valid() if self._pool else "?"
+            await self._send_plain(
+                chat_id,
+                f"✅ Loaded {new} new token(s) ({dups} duplicate(s) skipped). "
+                f"Valid tokens: {valid}. "
+                f"{resumed} paused task(s) re-queued.",
+                session,
+            )
+        else:
+            await self._send_plain(chat_id, "Token handler not configured.", session)
 
     # ------------------------------------------------------------------
     # Main polling loop
@@ -448,16 +552,27 @@ class TelegramBot:
                         msg = update.get("message")
                         if not msg:
                             continue
-                        text = msg.get("text", "")
-                        if not text.startswith("/"):
-                            continue
+
                         user_id = msg.get("from", {}).get("id")
                         chat_id = str(msg["chat"]["id"])
 
                         if not self._is_authorized(user_id):
-                            await self._send(
-                                chat_id, "Access denied.", session
-                            )
+                            text = msg.get("text", "")
+                            if text.startswith("/"):
+                                await self._send_plain(chat_id, "Access denied.", session)
+                            continue
+
+                        # Handle document uploads (token files)
+                        if "document" in msg:
+                            try:
+                                await self._handle_document(msg, chat_id, session)
+                            except Exception as exc:
+                                logger.error("Document handler error: %s", exc, exc_info=True)
+                                await self._send_plain(chat_id, f"Error: {exc}", session)
+                            continue
+
+                        text = msg.get("text", "")
+                        if not text.startswith("/"):
                             continue
 
                         try:
@@ -466,9 +581,7 @@ class TelegramBot:
                             logger.error(
                                 "Command handler error: %s", exc, exc_info=True
                             )
-                            await self._send(
-                                chat_id, f"Error: {exc}", session
-                            )
+                            await self._send_plain(chat_id, f"Error: {exc}", session)
 
             except asyncio.CancelledError:
                 raise

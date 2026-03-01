@@ -89,17 +89,42 @@ def check_session_validity(page: Page, wait_timeout: int = 8000) -> bool:
             logger.warning("check_session_validity: final URL is login page → invalid")
             return False
 
-    # If we're on x.com/home or just x.com (no login redirect happened)
-    # the session is most likely fine — X just didn't render the usual
-    # elements in headless mode.
-    stripped = final_url.rstrip("/")
-    if stripped in ("https://x.com", "https://x.com/home"):
-        logger.info(
-            "check_session_validity: URL is '%s' with no login redirect → "
-            "treating as valid (fallback)",
-            final_url,
+    # Check page title for stale-token indicators
+    try:
+        title = page.title()
+        logger.info("check_session_validity: page title = %r", title)
+    except Exception:
+        title = ""
+
+    if "It's what's happening" in title or "it's what's happening" in title.lower():
+        logger.warning(
+            "check_session_validity: title contains 'It's what's happening' → "
+            "stale token (public landing page)"
         )
+        return False
+
+    if "Log in" in title or "log in" in title.lower():
+        logger.warning("check_session_validity: title contains 'Log in' → invalid")
+        return False
+
+    # x.com/home with "Home" in title → valid
+    stripped = final_url.rstrip("/")
+    if stripped == "https://x.com/home":
+        logger.info("check_session_validity: URL is x.com/home → valid")
         return True
+
+    # Bare x.com/ without /home — only valid if title says "Home"
+    if stripped == "https://x.com":
+        if "Home" in title:
+            logger.info(
+                "check_session_validity: URL is x.com with 'Home' title → valid"
+            )
+            return True
+        logger.warning(
+            "check_session_validity: URL is x.com but title=%r (not 'Home') → invalid",
+            title,
+        )
+        return False
 
     logger.warning(
         "check_session_validity: no selectors found and URL '%s' is ambiguous → invalid",

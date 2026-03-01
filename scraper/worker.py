@@ -26,8 +26,9 @@ from scraper.auth import (
 
 logger = logging.getLogger(__name__)
 
-# Overall timeout for a single scrape_community() call (30 minutes).
-_SCRAPE_TIMEOUT_SEC = 30 * 60
+# Overall timeout for a single scrape_community() call (14 minutes).
+# The subprocess hard-kill in main.py uses 15 min, so this fires first.
+_SCRAPE_TIMEOUT_SEC = 14 * 60
 
 # Regex to match X profile links (1-15 alphanumerics / underscores)
 _PROFILE_LINK_RE = re.compile(r"^/([A-Za-z0-9_]{1,15})$")
@@ -393,6 +394,21 @@ def scrape_community(
             return [], f"failed to load {community_url}"
 
         _log_page_debug(page, "after community page load")
+
+        # --- Login redirect check (stale token) ---
+        post_goto_url = page.url
+        if "/flow/login" in post_goto_url or "/i/flow/" in post_goto_url:
+            logger.error("Community page redirected to login: %s", post_goto_url)
+            _save_debug_screenshot(page, "community_login_redirect")
+            return [], "auth_token_invalid"
+        try:
+            post_goto_title = page.title()
+            if "Log in" in post_goto_title or "log in" in post_goto_title.lower():
+                logger.error("Community page title is login page: %r", post_goto_title)
+                _save_debug_screenshot(page, "community_login_title")
+                return [], "auth_token_invalid"
+        except Exception:
+            pass
 
         # Check for error pages ("Something went wrong", JS disabled, etc.)
         try:
