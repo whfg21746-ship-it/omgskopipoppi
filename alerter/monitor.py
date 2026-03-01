@@ -27,6 +27,12 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
+
+def _escape_md(text: str) -> str:
+    """Escape Markdown special characters for Telegram parse_mode=Markdown."""
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!\\])', r'\\\1', text)
+
+
 # Regex for X community URLs
 COMMUNITY_RE = re.compile(
     r"https?://(?:twitter\.com|x\.com)/(?:i/)?communities/(\d+)"
@@ -303,9 +309,11 @@ class DexScreenerMonitor:
             if "/members" not in members_url:
                 members_url = members_url.rstrip("/") + "/members"
 
+            safe_name = _escape_md(token_name)
+            safe_symbol = _escape_md(token_symbol)
             alert_text = (
                 f"New token with X Community!\n\n"
-                f"Token: {token_name} (${token_symbol})\n"
+                f"Token: {safe_name} (${safe_symbol})\n"
                 f"Chain: {chain_id}\n"
                 f"Address: {address[:8]}...{address[-6:]}\n"
                 f"MCap: ${fdv:,.0f}\n"

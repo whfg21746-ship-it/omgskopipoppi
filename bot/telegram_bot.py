@@ -6,6 +6,7 @@ import asyncio
 import io
 import logging
 import os
+import re
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine
@@ -17,6 +18,11 @@ from config import TELEGRAM_BOT_TOKEN, TELEGRAM_USER_IDS
 from database.db import Database
 
 logger = logging.getLogger(__name__)
+
+
+def _escape_md(text: str) -> str:
+    """Escape Markdown special characters for Telegram parse_mode=Markdown."""
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!\\])', r'\\\1', text)
 
 
 class TelegramBot:
@@ -208,7 +214,7 @@ class TelegramBot:
                 "completed": "✅",
                 "failed": "❌",
             }.get(t["status"], "❓")
-            name = t.get("token_name") or t["community_id"]
+            name = _escape_md(t.get("token_name") or t["community_id"])
             lines.append(
                 f"{status_icon} #{t['id']} | {name} | "
                 f"{t['status']} | {t.get('usernames_count', 0)} users"

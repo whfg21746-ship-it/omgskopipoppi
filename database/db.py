@@ -23,6 +23,7 @@ class Database:
         self._local = threading.local()
         # Run migration on init thread
         self._migrate()
+        self._reset_stuck_tasks()
 
     # ------------------------------------------------------------------
     # Connection helpers
@@ -44,6 +45,17 @@ class Database:
         conn.executescript(SCHEMA_SQL)
         conn.commit()
         logger.info("Database schema applied at %s", self._db_path)
+
+    def _reset_stuck_tasks(self) -> None:
+        """Reset tasks stuck in 'in_progress' back to 'pending' on startup."""
+        conn = self._get_conn()
+        cur = conn.execute(
+            "UPDATE scrape_tasks SET status='pending', started_at=NULL "
+            "WHERE status='in_progress'"
+        )
+        conn.commit()
+        if cur.rowcount:
+            logger.info("Reset %d stuck in_progress task(s) to pending", cur.rowcount)
 
     # ------------------------------------------------------------------
     # Scrape tasks

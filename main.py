@@ -25,6 +25,11 @@ from bot.telegram_bot import TelegramBot
 from database.db import Database
 from scraper.worker import scrape_community
 
+
+def _escape_md(text: str) -> str:
+    """Escape Markdown special characters for Telegram parse_mode=Markdown."""
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!\\])', r'\\\1', text)
+
 # ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
@@ -182,8 +187,9 @@ async def scraper_loop(db: Database, bot: TelegramBot) -> None:
 
             if error:
                 db.mark_task_failed(task_id, error)
+                safe_name = _escape_md(token_name)
                 await bot.broadcast(
-                    f"❌ Scrape failed for *{token_name}*:\n`{error}`"
+                    f"❌ Scrape failed for *{safe_name}*:\n`{error}`"
                 )
                 logger.error("Task #%d failed: %s", task_id, error)
                 # Cool down before next task
@@ -193,8 +199,9 @@ async def scraper_loop(db: Database, bot: TelegramBot) -> None:
             # Success — save usernames
             saved = db.save_usernames(task_id, community_id, usernames)
             db.mark_task_completed(task_id, len(usernames))
+            safe_name = _escape_md(token_name)
             await bot.broadcast(
-                f"✅ Scraped *{token_name}*: "
+                f"✅ Scraped *{safe_name}*: "
                 f"{len(usernames)} usernames ({saved} new)"
             )
             logger.info(
