@@ -343,10 +343,10 @@ class XPoster:
         text: str,
         media_id: str | None = None,
     ) -> dict[str, Any]:
-        """Post a tweet in a community via GraphQL CreateTweet mutation.
+        """Post a tweet INSIDE a community via GraphQL CreateTweet mutation.
 
-        Uses the exact headers and payload from the working reference.
-        CreateTweet headers use Chrome/141 (different from upload's Chrome/136).
+        Critical: semantic_annotation_ids must map the community_id for the
+        tweet to land inside the community (not on the user's timeline).
         """
         if not community_id:
             raise ValueError("community_id is required to post inside a community")
@@ -385,28 +385,43 @@ class XPoster:
         else:
             media_entities = []
 
-        # Full features dict from the working reference (includes additional
-        # keys like articles_preview_enabled, grok_* that were previously missing)
         payload = {
             "variables": {
                 "tweet_text": text,
                 "community_id": str(community_id),
+                "broadcast": True,
                 "dark_request": False,
+                "disallowed_reply_options": None,
                 "media": {
                     "media_entities": media_entities,
                     "possibly_sensitive": False,
                 },
-                "semantic_annotation_ids": [],
+                # THIS is what makes the tweet land INSIDE the community
+                "semantic_annotation_ids": [
+                    {
+                        "group_id": "8",
+                        "domain_id": "31",
+                        "entity_id": str(community_id),
+                    }
+                ],
             },
             "features": {
+                "premium_content_api_read_enabled": False,
                 "communities_web_enable_tweet_community_results_fetch": True,
                 "c9s_tweet_anatomy_moderator_badge_enabled": True,
+                "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
+                "responsive_web_grok_analyze_post_followups_enabled": True,
+                "responsive_web_jetfuel_frame": True,
+                "responsive_web_grok_share_attachment_enabled": True,
+                "responsive_web_grok_annotations_enabled": False,
                 "responsive_web_edit_tweet_api_enabled": True,
                 "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
                 "view_counts_everywhere_api_enabled": True,
                 "longform_notetweets_consumption_enabled": True,
                 "responsive_web_twitter_article_tweet_consumption_enabled": True,
                 "tweet_awards_web_tipping_enabled": False,
+                "responsive_web_grok_show_grok_translated_post": False,
+                "responsive_web_grok_analysis_button_from_backend": True,
                 "creator_subscriptions_quote_tweet_preview_enabled": False,
                 "longform_notetweets_rich_text_read_enabled": True,
                 "longform_notetweets_inline_media_enabled": True,
