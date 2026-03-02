@@ -24,21 +24,30 @@ def post_to_community(
 ) -> dict[str, Any]:
     """Synchronous function: join community, post tweet, return result dict.
 
+    Uses ``get_next_available_account()`` which skips failed accounts and
+    accounts that have reached the 5-post limit.  On any error the current
+    account is marked failed and the index advances so the next call picks
+    a fresh account.
+
     Designed to be called via ``asyncio.to_thread()``.
     """
-    account = post_pool.get_current_account()
+    account, account_index = post_pool.get_next_available_account()
     if account is None:
+        if post_pool.all_accounts_exhausted():
+            logger.warning("All accounts exhausted (5 posts each or failed)")
         return {
             "success": False,
             "tweet_id": None,
             "tweet_url": None,
-            "error": "no valid posting accounts",
+            "error": "no available posting accounts",
             "account_index": -1,
+            "account_token": None,
+            "exhausted": post_pool.all_accounts_exhausted(),
         }
 
-    account_index = post_pool.get_current_index()
     auth_token = account["auth_token"]
     token_preview = auth_token[:8]
+    post_count = post_pool.get_post_count(auth_token)
 
     try:
         session = curl_requests.Session(impersonate="chrome136")
@@ -67,6 +76,8 @@ def post_to_community(
                 "tweet_url": None,
                 "error": "no tweet templates configured",
                 "account_index": account_index,
+                "account_token": auth_token,
+                "exhausted": False,
             }
 
         text = template.replace("{token_name}", token_name)
@@ -101,32 +112,52 @@ def post_to_community(
             pass
 
         if tweet_id:
+            # --- Success: increment post count ---
+            new_count = post_pool.increment_post_count(auth_token)
             tweet_url = f"https://x.com/i/communities/{community_id}/status/{tweet_id}"
-            logger.info("Tweet posted successfully: %s", tweet_url)
+            logger.info(
+                "Tweet posted successfully: %s (account #%d %s..., post %d/5)",
+                tweet_url, account_index, token_preview, new_count,
+            )
+            # Rotate to next account for the next call
+            post_pool.rotate_account()
             return {
                 "success": True,
                 "tweet_id": tweet_id,
                 "tweet_url": tweet_url,
                 "error": None,
                 "account_index": account_index,
+                "account_token": auth_token,
+                "post_count": new_count,
+                "exhausted": False,
             }
         else:
             error_msg = str(resp_data)[:200]
             logger.error("CreateTweet did not return tweet_id: %s", error_msg)
+            # --- Failure: mark account failed, rotate ---
+            post_pool.mark_account_failed(auth_token)
+            post_pool.rotate_account()
             return {
                 "success": False,
                 "tweet_id": None,
                 "tweet_url": None,
                 "error": f"no tweet_id in response: {error_msg}",
                 "account_index": account_index,
+                "account_token": auth_token,
+                "exhausted": post_pool.all_accounts_exhausted(),
             }
 
     except Exception as exc:
         logger.error("post_to_community failed: %s", exc, exc_info=True)
+        # --- Exception: mark account failed, rotate ---
+        post_pool.mark_account_failed(auth_token)
+        post_pool.rotate_account()
         return {
             "success": False,
             "tweet_id": None,
             "tweet_url": None,
             "error": str(exc),
             "account_index": account_index,
+            "account_token": auth_token,
+            "exhausted": post_pool.all_accounts_exhausted(),
         }

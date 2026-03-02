@@ -190,15 +190,17 @@ async def _auto_post_wrapper(
         )
 
         account_index = result.get("account_index", -1)
-        account = post_pool.get_current_account()
-        token_preview = account["auth_token"][:8] if account else "???"
+        account_token = result.get("account_token")
+        token_preview = account_token[:8] if account_token else "???"
 
         if result["success"]:
             tweet_url = result.get("tweet_url", "")
+            post_count = result.get("post_count", "?")
             msg = (
                 f"Posted in {token_name} community!\n"
                 f"Link: {tweet_url}\n"
-                f"Account: #{account_index} ({token_preview}...)"
+                f"Account: #{account_index} ({token_preview}...) "
+                f"[post {post_count}/5]"
             )
             reply_markup = {
                 "inline_keyboard": [[
@@ -211,19 +213,36 @@ async def _auto_post_wrapper(
             await bot.broadcast_with_markup(msg, reply_markup)
         else:
             error = result.get("error", "unknown error")
-            msg = (
-                f"Failed to post in {token_name}: {error}\n"
-                f"Account: #{account_index} ({token_preview}...)"
-            )
-            reply_markup = {
-                "inline_keyboard": [[
-                    {
-                        "text": "Retry with different account",
-                        "callback_data": f"repost:{community_id}:{community_url}:{token_name}:{token_symbol}",
-                    }
-                ]]
-            }
-            await bot.broadcast_with_markup(msg, reply_markup)
+
+            # Notify about the failed account (if there was one)
+            if account_token:
+                await bot.broadcast(
+                    f"Account #{account_index} ({token_preview}...) failed: "
+                    f"{error}, switching to next account"
+                )
+
+            # Check if all accounts are exhausted
+            if result.get("exhausted"):
+                logger.warning("All accounts exhausted (5 posts each or failed)")
+                post_pool.set_enabled(False)
+                await bot.broadcast(
+                    "All posting accounts exhausted (5 posts each or failed). "
+                    "Auto-posting disabled. Add new accounts via Post Accounts menu."
+                )
+            else:
+                msg = (
+                    f"Failed to post in {token_name}: {error}\n"
+                    f"Account: #{account_index} ({token_preview}...)"
+                )
+                reply_markup = {
+                    "inline_keyboard": [[
+                        {
+                            "text": "Retry with different account",
+                            "callback_data": f"repost:{community_id}:{community_url}:{token_name}:{token_symbol}",
+                        }
+                    ]]
+                }
+                await bot.broadcast_with_markup(msg, reply_markup)
 
     except Exception as exc:
         logger.error("Auto-post error (non-fatal): %s", exc, exc_info=True)

@@ -28,6 +28,9 @@ _DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 
+MAX_POSTS_PER_ACCOUNT = 5
+
+
 class PostPool:
     """Manages posting accounts, tweet templates and images.
 
@@ -37,6 +40,9 @@ class PostPool:
     def __init__(self) -> None:
         self._config: dict[str, Any] = dict(_DEFAULT_CONFIG)
         _IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        # In-memory counters — reset on restart (intentional)
+        self._post_counts: dict[str, int] = {}   # auth_token -> successful post count
+        self._failed_accounts: set[str] = set()   # auth_tokens that failed during this session
         self._load()
 
     # ------------------------------------------------------------------
@@ -136,6 +142,68 @@ class PostPool:
 
     def get_current_index(self) -> int:
         return self._config.get("current_account_index", 0)
+
+    def get_next_available_account(self) -> tuple[dict[str, Any] | None, int]:
+        """Find the next account that is valid, not failed, and under the post limit.
+
+        Returns ``(account_dict, index)`` or ``(None, -1)`` if all exhausted.
+        """
+        accounts = self._config.get("accounts", [])
+        if not accounts:
+            return None, -1
+
+        start = self._config.get("current_account_index", 0)
+        for i in range(len(accounts)):
+            idx = (start + i) % len(accounts)
+            acc = accounts[idx]
+            token = acc["auth_token"]
+
+            if not acc.get("valid", True):
+                continue
+            if token in self._failed_accounts:
+                continue
+            if self._post_counts.get(token, 0) >= MAX_POSTS_PER_ACCOUNT:
+                continue
+
+            # Found a usable account — park the index here
+            self._config["current_account_index"] = idx
+            self._save()
+            count = self._post_counts.get(token, 0)
+            logger.info(
+                "Using account #%d %s... (post %d/%d)",
+                idx, token[:8], count + 1, MAX_POSTS_PER_ACCOUNT,
+            )
+            return acc, idx
+
+        # Nothing available
+        return None, -1
+
+    def mark_account_failed(self, auth_token: str) -> None:
+        """Mark an account as temporarily failed for this session."""
+        self._failed_accounts.add(auth_token)
+        logger.warning("Account %s... marked as failed", auth_token[:8])
+
+    def increment_post_count(self, auth_token: str) -> int:
+        """Increment and return the new post count for an account."""
+        self._post_counts[auth_token] = self._post_counts.get(auth_token, 0) + 1
+        return self._post_counts[auth_token]
+
+    def get_post_count(self, auth_token: str) -> int:
+        return self._post_counts.get(auth_token, 0)
+
+    def all_accounts_exhausted(self) -> bool:
+        """Return True if every valid account is either failed or at the post limit."""
+        accounts = self._config.get("accounts", [])
+        for acc in accounts:
+            if not acc.get("valid", True):
+                continue
+            token = acc["auth_token"]
+            if token in self._failed_accounts:
+                continue
+            if self._post_counts.get(token, 0) >= MAX_POSTS_PER_ACCOUNT:
+                continue
+            return False
+        return True
 
     def has_accounts(self) -> bool:
         return any(a.get("valid", True) for a in self._config.get("accounts", []))
