@@ -205,6 +205,18 @@ class XPoster:
         """
         upload_url = "https://upload.x.com/i/media/upload.json"
 
+        # Detect media type from file extension
+        ext = os.path.splitext(image_path)[1].lower()
+        mime_map = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+        }
+        media_type = mime_map.get(ext, "image/jpeg")
+        logger.info("Detected media type: %s (ext=%s) for %s", media_type, ext, image_path)
+
         # Media upload uses Chrome/136 sec-ch-ua (matches reference)
         headers = {
             "accept": "*/*",
@@ -236,7 +248,7 @@ class XPoster:
         try:
             headers["x-client-transaction-id"] = xtid.generate_transaction_id(
                 method="POST",
-                path="https://upload.x.com/i/media/upload.json",
+                path="/i/media/upload.json",
             )
         except Exception:
             pass
@@ -247,7 +259,7 @@ class XPoster:
         init_params = {
             "command": "INIT",
             "total_bytes": media_size,
-            "media_type": "image/jpeg",
+            "media_type": media_type,
             "media_category": "tweet_image",
         }
         r_init = None
@@ -286,23 +298,34 @@ class XPoster:
             "media_id": media_id,
             "segment_index": 0,
         }
+        # CurlMime content_type uses short form (image/jpg) matching reference
+        mime_short = {
+            "image/jpeg": "image/jpg",
+            "image/png": "image/png",
+            "image/gif": "image/gif",
+            "image/webp": "image/webp",
+        }
+        append_content_type = mime_short.get(media_type, "image/jpg")
+        append_filename = "image" + (ext if ext else ".jpg")
+
         mp = CurlMime()
         mp.addpart(
             name="media",
-            content_type="image/jpg",
-            filename="image.jpg",
+            content_type=append_content_type,
+            filename=append_filename,
             data=media_data,
         )
+        r_append = None
         for attempt in range(3):
             try:
-                session.post(upload_url, headers=headers, data=append_params, multipart=mp)
+                r_append = session.post(upload_url, headers=headers, data=append_params, multipart=mp)
                 break
             except Exception as exc:
                 if attempt == 2:
                     logger.error("Media APPEND failed after 3 attempts: %s", exc)
                     return None
                 time.sleep(1)
-        logger.info("Media APPEND complete")
+        logger.info("Media APPEND complete: status=%d", r_append.status_code)
 
         # Step 3 — FINALIZE
         finalize_params = {
