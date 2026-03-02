@@ -174,6 +174,18 @@ class XPoster:
         return data
 
     @staticmethod
+    def _detect_media_type(image_path: str) -> str:
+        """Detect MIME type from file extension."""
+        ext = image_path.rsplit(".", 1)[-1].lower() if "." in image_path else ""
+        return {
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "png": "image/png",
+            "gif": "image/gif",
+            "webp": "image/webp",
+        }.get(ext, "image/jpeg")
+
+    @staticmethod
     def upload_media(
         session: curl_requests.Session,
         ct0: str,
@@ -193,39 +205,44 @@ class XPoster:
         headers_no_ct = {k: v for k, v in headers.items() if k != "Content-Type"}
 
         file_size = os.path.getsize(image_path)
+        media_type = XPoster._detect_media_type(image_path)
+        logger.info("Detected media type: %s for %s", media_type, image_path)
 
         # Step 1 — INIT
         init_params = {
             "command": "INIT",
             "total_bytes": str(file_size),
-            "media_type": "image/jpeg",
+            "media_type": media_type,
             "media_category": "tweet_image",
         }
         resp = session.post(upload_url, headers=headers_no_ct, params=init_params)
         init_data = resp.json()
         media_id = str(init_data["media_id"])
-        logger.info("Media INIT: media_id=%s", media_id)
+        logger.info("Media INIT: status=%d, media_id=%s", resp.status_code, media_id)
 
-        # Step 2 — APPEND
-        mime = CurlMime()
-        mime.addpart(
+        # Step 2 — APPEND (must use CurlMime with raw bytes, not local_path)
+        with open(image_path, "rb") as f:
+            media_data = f.read()
+
+        mp = CurlMime()
+        mp.addpart(
             name="media",
-            filename=os.path.basename(image_path),
-            content_type="application/octet-stream",
-            local_path=image_path,
+            content_type="image/jpg",
+            filename="image.jpg",
+            data=media_data,
         )
         append_params = {
             "command": "APPEND",
             "media_id": media_id,
             "segment_index": "0",
         }
-        session.post(
+        resp = session.post(
             upload_url,
             headers=headers_no_ct,
-            params=append_params,
-            multipart=mime,
+            data=append_params,
+            multipart=mp,
         )
-        logger.info("Media APPEND complete")
+        logger.info("Media APPEND: status=%d", resp.status_code)
 
         # Step 3 — FINALIZE
         finalize_params = {
@@ -234,4 +251,6 @@ class XPoster:
         }
         resp = session.post(upload_url, headers=headers_no_ct, params=finalize_params)
         logger.info("Media FINALIZE: status=%d", resp.status_code)
+        if resp.status_code != 200 and resp.status_code != 201:
+            logger.error("Media FINALIZE error body: %s", resp.text[:500])
         return media_id
