@@ -132,7 +132,7 @@ async def on_new_task(
             t_symbol = sym_match.group(1)
 
         asyncio.create_task(
-            run_auto_post(community_id, community_url, t_name, t_symbol, _post_pool, _bot)
+            _auto_post_wrapper(community_id, community_url, t_name, t_symbol, _post_pool, _bot)
         )
 
 
@@ -141,7 +141,31 @@ async def on_new_task(
 # ---------------------------------------------------------------------------
 
 
-async def run_auto_post(
+def _auto_post_sync(
+    community_id: str,
+    community_url: str,
+    token_name: str,
+    token_symbol: str,
+    post_pool: PostPool,
+) -> dict[str, Any]:
+    """Fully synchronous auto-post: delay + post.  Runs entirely in a thread.
+
+    Includes the configurable delay (time.sleep) so nothing ever touches
+    the asyncio event loop.
+    """
+    import time as _time
+
+    try:
+        _time.sleep(post_pool.delay)
+    except Exception:
+        pass
+
+    return post_to_community(
+        community_id, community_url, token_name, token_symbol, post_pool,
+    )
+
+
+async def _auto_post_wrapper(
     community_id: str,
     community_url: str,
     token_name: str,
@@ -149,11 +173,15 @@ async def run_auto_post(
     post_pool: PostPool,
     bot: TelegramBot,
 ) -> None:
-    """Run auto-posting in background. ALL errors caught — never crashes main loop."""
+    """Thin async wrapper: offloads ALL sync work to a thread, then sends Telegram result.
+
+    ALL errors caught — auto-posting failures never crash the main loop.
+    """
     try:
-        await asyncio.sleep(post_pool.delay)
+        # The ENTIRE sync chain (delay + curl_cffi calls) runs in a thread.
+        # The event loop stays free for monitor polling and Telegram bot.
         result = await asyncio.to_thread(
-            post_to_community,
+            _auto_post_sync,
             community_id,
             community_url,
             token_name,
@@ -166,7 +194,6 @@ async def run_auto_post(
         token_preview = account["auth_token"][:8] if account else "???"
 
         if result["success"]:
-            tweet_id = result["tweet_id"]
             tweet_url = result.get("tweet_url", "")
             msg = (
                 f"Posted in {token_name} community!\n"

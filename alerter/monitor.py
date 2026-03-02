@@ -217,7 +217,9 @@ class DexScreenerMonitor:
         self._running = True
         logger.info("DexScreener monitor started (interval=%ds)", CHECK_INTERVAL)
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as session:
             while self._running:
                 try:
                     await self._poll(session)
